@@ -2,15 +2,16 @@ module.exports = {
   apps: [{
     name: 'confirmed-backend',
     script: 'src/server.js',
-    instances: 'max',
-    exec_mode: 'cluster',
+    cwd: '/var/www/confirmed.tn/confirmed_backend_new',
+    instances: 1,
+    exec_mode: 'fork',
     env: {
       NODE_ENV: 'development',
       PORT: 3000
     },
     env_production: {
       NODE_ENV: 'production',
-      PORT: 3000
+      PORT: 8000
     },
     error_file: './logs/err.log',
     out_file: './logs/out.log',

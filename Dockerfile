@@ -7,10 +7,11 @@ RUN npm ci --only=production
 
 COPY src/ ./src/
 
-RUN mkdir -p logs
+# Create required directories
+RUN mkdir -p logs uploads/complaints
 
 EXPOSE 3000
 
 USER node
 
-CMD ["npm", "start"]
+CMD ["node", "src/server.js"]

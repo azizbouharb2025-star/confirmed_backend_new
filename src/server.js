@@ -1,5 +1,6 @@
 const path = require('path');
-require('dotenv').config();
+// Load .env from the project root regardless of where PM2 starts the process
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -91,39 +92,52 @@ app.set('io', io);
 // Initialize Sentry
 initSentry(app);
 
-// Security middleware
-app.use(httpsRedirect);
-app.use(helmet());
-
 // Allowed origins for CORS
 const allowedOrigins = [
-  'http://localhost:8000', 
-  'http://127.0.0.1:8000', 
+  'http://localhost:3000',
   'http://localhost:3001',
+  'http://localhost:8000',
+  'http://127.0.0.1:8000',
   'https://confirmed.tn',
   'https://www.confirmed.tn',
   'https://api.confirmed.tn'
 ];
 
-// Explicit preflight handler — ensures OPTIONS responses always include CORS headers
-// even when behind Cloudflare or other proxies that may strip them
+// ── CORS must be registered BEFORE helmet, httpsRedirect, and rate limiters ──
+// Explicit preflight handler for OPTIONS — must be first to ensure CORS headers
+// are always present even when Cloudflare or other proxies are involved.
 app.options('*', (req, res) => {
   const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
+  if (origin && allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-API-Key');
     res.setHeader('Access-Control-Max-Age', '86400');
+    res.setHeader('Vary', 'Origin');
   }
-  res.sendStatus(204);
+  return res.sendStatus(204);
 });
 
 app.use(cors({
-  origin: allowedOrigins,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS policy: origin ${origin} not allowed`));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+  optionsSuccessStatus: 204
+}));
+
+// Security middleware — after CORS so headers are not interfered with
+app.use(httpsRedirect);
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
 }));
 app.use(sanitizeInput);
 

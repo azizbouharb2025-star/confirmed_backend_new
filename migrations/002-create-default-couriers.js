@@ -1,3 +1,4 @@
+git checkout --ours components/ui/ConnectionStatus.tsx
 /**
  * Migration: Create default couriers
  * Run with: node migrations/002-create-default-couriers.js
