@@ -1,11 +1,36 @@
 const express = require('express');
 const Joi = require('joi');
+const multer = require('multer');
 const Order = require('../models/Order');
+const ImportHistory = require('../models/ImportHistory');
 const { auth, authorize } = require('../middleware/auth');
 const { getRedisClient } = require('../config/redis');
 const orderService = require('../services/orderService');
 const exportService = require('../services/exportService');
+const importService = require('../services/importService');
 const { applyTierFilters } = require('../middleware/tierCheck');
+
+// Multer memory storage for file imports (max 50 MB)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-excel',
+      'text/csv',
+      'text/plain',
+      'application/csv',
+      'application/octet-stream'
+    ];
+    const ext = (file.originalname || '').toLowerCase();
+    if (allowed.includes(file.mimetype) || ext.endsWith('.xlsx') || ext.endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Seuls les fichiers XLSX et CSV sont acceptés'));
+    }
+  }
+});
 
 const router = express.Router();
 
@@ -277,5 +302,262 @@ router.delete('/:id', auth, async (req, res, next) => {
     next(error);
   }
 });
+
+// ─── BULK IMPORT MODULE ────────────────────────────────────────────────────────
+
+/**
+ * POST /api/orders/import/preview
+ * Step 1: Upload file and get AI column detection + validation preview (dry run).
+ * Does NOT save anything to the database.
+ * Body: multipart/form-data with field "file"
+ */
+router.post(
+  '/import/preview',
+  auth,
+  authorize('shop_owner'),
+  upload.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'Aucun fichier reçu' });
+      }
+
+      const result = await importService.processImport(
+        req.file.buffer,
+        req.file.mimetype,
+        {
+          shopId: req.user.shopId,
+          userId: req.user._id,
+          fileName: req.file.originalname,
+          duplicateAction: req.body.duplicateAction || 'ignore',
+          dryRun: true,
+          Order,
+          ImportHistory
+        }
+      );
+
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/orders/import/confirm
+ * Step 2: Actually import the orders after preview confirmation.
+ * Body: multipart/form-data with field "file" + optional duplicateAction
+ */
+router.post(
+  '/import/confirm',
+  auth,
+  authorize('shop_owner'),
+  upload.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'Aucun fichier reçu' });
+      }
+
+      const result = await importService.processImport(
+        req.file.buffer,
+        req.file.mimetype,
+        {
+          shopId: req.user.shopId,
+          userId: req.user._id,
+          fileName: req.file.originalname,
+          duplicateAction: req.body.duplicateAction || 'ignore',
+          dryRun: false,
+          Order,
+          ImportHistory
+        }
+      );
+
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/orders/import/history
+ * Get import history for the current shop owner.
+ */
+router.get('/import/history', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+
+    const [history, total] = await Promise.all([
+      ImportHistory.find({ shopId: req.user.shopId })
+        .sort({ createdAt: -1 })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean(),
+      ImportHistory.countDocuments({ shopId: req.user.shopId })
+    ]);
+
+    res.json({
+      history,
+      total,
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── DELIVERY EXPORT MODULE ────────────────────────────────────────────────────
+
+/**
+ * GET /api/orders/ready-to-ship
+ * Get orders that are ready for shipping (confirmed, complete info, no blocks).
+ * Supports pagination and filtering.
+ */
+router.get('/ready-to-ship', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const { page = 1, limit = 50, aiScoreMin = 0 } = req.query;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
+    const aiMin = parseInt(aiScoreMin, 10) || 0;
+
+    const query = {
+      shopId: req.user.shopId,
+      status: 'confirmed',
+      'clientInfo.phone': { $exists: true, $ne: '' },
+      'clientInfo.name': { $exists: true, $ne: '' }
+    };
+
+    // Apply AI score filter if threshold set
+    if (aiMin > 0) {
+      query.$or = [
+        { aiScore: { $gte: aiMin } },
+        { aiScore: { $exists: false } } // orders without score are included
+      ];
+    }
+
+    const [orders, total] = await Promise.all([
+      Order.find(query)
+        .sort({ createdAt: -1 })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .select('orderId clientInfo items totalAmount status aiScore riskLevel region createdAt deliveryInfo')
+        .lean(),
+      Order.countDocuments(query)
+    ]);
+
+    res.json({
+      orders,
+      total,
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/orders/export-delivery
+ * Export confirmed orders formatted for a specific delivery company.
+ * Body: { courierName: string, orderIds?: string[] }
+ * Returns a CSV file.
+ */
+router.post('/export-delivery', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const { courierName = 'general', orderIds } = req.body;
+
+    // Build query
+    const query = {
+      shopId: req.user.shopId,
+      status: 'confirmed'
+    };
+
+    if (orderIds && Array.isArray(orderIds) && orderIds.length > 0) {
+      query._id = { $in: orderIds };
+    }
+
+    const orders = await Order.find(query)
+      .sort({ createdAt: -1 })
+      .limit(5000)
+      .lean();
+
+    if (orders.length === 0) {
+      return res.status(404).json({ error: 'Aucune commande prête à expédier trouvée' });
+    }
+
+    // Generate CSV based on courier format
+    const csv = generateDeliveryCSV(orders, courierName);
+    const dateStr = new Date().toISOString().split('T')[0];
+    const filename = `export-livraison-${courierName.toLowerCase()}-${dateStr}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send('\uFEFF' + csv); // BOM for Excel compatibility
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Generate a CSV string for delivery company exports.
+ * @param {object[]} orders
+ * @param {string} courierName
+ * @returns {string}
+ */
+function generateDeliveryCSV(orders, courierName) {
+  const esc = (v) => {
+    const s = String(v || '');
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  };
+
+  // Courier-specific column layouts
+  const courierFormats = {
+    intigo: ['Référence', 'Nom Client', 'Téléphone', 'Adresse', 'Ville', 'Gouvernorat', 'Montant', 'Produit', 'Quantité'],
+    aramex: ['Reference', 'Consignee Name', 'Consignee Phone', 'Consignee Address', 'City', 'Country', 'COD Amount', 'Item Description'],
+    yalidine: ['Tracking', 'Nom', 'Téléphone', 'Adresse', 'Wilaya', 'Commune', 'Montant', 'Produit'],
+    rapid_poste: ['N° Commande', 'Destinataire', 'Téléphone', 'Adresse Livraison', 'Code Postal', 'Gouvernorat', 'Montant COD'],
+    general: ['N° Commande', 'Nom Client', 'Téléphone', 'Adresse', 'Ville', 'Région', 'Montant Total', 'Produits', 'Statut']
+  };
+
+  const format = courierName.toLowerCase().replace(/\s+/g, '_');
+  const headers = courierFormats[format] || courierFormats.general;
+
+  const rows = orders.map(order => {
+    const name = order.clientInfo?.name || '';
+    const phone = order.clientInfo?.phone || '';
+    const address = order.clientInfo?.address;
+    const street = address?.street || '';
+    const city = address?.city || '';
+    const region = address?.state || order.region || '';
+    const zipCode = address?.zipCode || '';
+    const amount = order.totalAmount || 0;
+    const items = (order.items || []).map(i => `${i.name} x${i.quantity}`).join(' | ');
+
+    switch (format) {
+      case 'intigo':
+        return [order.orderId, name, phone, street, city, region, amount, items, (order.items || []).reduce((s, i) => s + (i.quantity || 1), 0)];
+      case 'aramex':
+        return [order.orderId, name, phone, `${street} ${city}`.trim(), city, 'TN', amount, items];
+      case 'yalidine':
+        return [order.orderId, name, phone, street, region, city, amount, items];
+      case 'rapid_poste':
+        return [order.orderId, name, phone, street, zipCode, region, amount];
+      default:
+        return [order.orderId, name, phone, street, city, region, amount, items, order.status];
+    }
+  });
+
+  return [
+    headers.map(esc).join(','),
+    ...rows.map(row => row.map(esc).join(','))
+  ].join('\n');
+}
 
 module.exports = router;
