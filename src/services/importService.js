@@ -174,7 +174,9 @@ function validatePhone(phone) {
 
 /**
  * Validate a single row of data against CONFIRMED fields.
- * Returns a status: 'valid', 'warning', or 'rejected', plus error messages.
+ * Rule: the ONLY hard requirement is a valid phone number.
+ *       Everything else (name, address, amount) generates a warning at most.
+ * Returns a status: 'valid', 'warning', or 'rejected', plus messages.
  * @param {object} row - Mapped row with CONFIRMED field names as keys
  * @param {number} index
  * @returns {{ status: string, warnings: string[], errors: string[] }}
@@ -182,33 +184,30 @@ function validatePhone(phone) {
 function validateRow(row, index) {
   const errors = [];
   const warnings = [];
-  
-  // Required: clientName
-  if (!row.clientName || row.clientName.trim() === '') {
-    errors.push('Nom client manquant');
-  } else if (row.clientName.trim().split(' ').length < 1 || row.clientName.trim().length < 2) {
-    warnings.push('Nom incomplet');
-  }
-  
-  // Required: clientPhone
+
+  // ── Only hard requirement: phone number ────────────────────────────────────
   const phoneValidation = validatePhone(row.clientPhone);
   if (!phoneValidation.valid) {
     errors.push(phoneValidation.message || 'Numéro de téléphone invalide');
   }
-  
-  // Warning: address empty
+
+  // ── Soft warnings (do not reject) ─────────────────────────────────────────
+  if (!row.clientName || row.clientName.trim().length < 2) {
+    warnings.push('Nom client manquant ou incomplet');
+  }
+
   if (!row.address || row.address.trim() === '') {
     warnings.push('Adresse vide');
   }
-  
-  // Warning: amount suspicious
+
   if (row.totalAmount) {
     const amount = parseFloat(row.totalAmount);
-    if (isNaN(amount) || amount <= 0) {
-      errors.push('Montant invalide');
+    if (isNaN(amount) || amount < 0) {
+      warnings.push('Montant invalide');
     }
   }
-  
+
+  // ── Result ─────────────────────────────────────────────────────────────────
   if (errors.length > 0) {
     return { status: 'rejected', warnings, errors };
   }
