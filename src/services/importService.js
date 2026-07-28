@@ -6,6 +6,10 @@ const logger = require('../utils/logger');
  * Column alias mappings for AI column detection.
  * Maps common column names from various e-commerce platforms to CONFIRMED standard fields.
  * Supports: Converty, Tiktak Pro, Shopify, WooCommerce, PrestaShop, custom Excel files.
+ *
+ * RULES:
+ * - Exact aliases: full header must match exactly (after normalization)
+ * - Fuzzy matching is done separately with exclusion guards
  */
 const COLUMN_ALIASES = {
   clientName: [
@@ -35,10 +39,17 @@ const COLUMN_ALIASES = {
     'billing address', 'adresse_livraison', 'adresse complète', 'adresse complete'
   ],
   totalAmount: [
-    'montant', 'total', 'prix', 'price', 'order total', 'total price',
-    'amount', 'valeur', 'valeur commande', 'total commande', 'prix total',
-    'order amount', 'price total', 'sum', 'total_amount', 'montant_total',
-    'prix commande', 'subtotal'
+    // Exact matches only — ambiguous words like "price" are handled in fuzzy with guards
+    'montant', 'total', 'order total', 'total price', 'total commande',
+    'montant total', 'valeur commande', 'prix total', 'order amount',
+    'total_amount', 'montant_total', 'prix commande', 'subtotal',
+    'prix', 'price', 'amount', 'valeur', 'sum'
+  ],
+  deliveryCost: [
+    // Separate field so delivery price is NEVER confused with order total
+    'delivery price', 'frais livraison', 'shipping cost', 'frais de livraison',
+    'delivery cost', 'shipping price', 'shipping fee', 'delivery fee',
+    'cout livraison', 'coût livraison', 'prix livraison'
   ],
   productName: [
     'produit', 'product', 'article', 'item', 'product name', 'item name',
@@ -61,6 +72,16 @@ const COLUMN_ALIASES = {
 };
 
 /**
+ * Words that indicate a column is NOT the order total amount.
+ * Used to block fuzzy matching of totalAmount when these words appear in the header.
+ */
+const TOTAL_AMOUNT_BLOCKLIST = [
+  'delivery', 'livraison', 'shipping', 'frais', 'fee', 'cost',
+  'tax', 'taxe', 'tva', 'discount', 'remise', 'reduction',
+  'tip', 'surcharge', 'handling'
+];
+
+/**
  * Normalize a header string for comparison: lowercase, remove accents and special chars.
  * @param {string} header
  * @returns {string}
@@ -76,12 +97,15 @@ function normalizeHeader(header) {
 
 /**
  * Detect which CONFIRMED field a raw column header maps to.
+ * Priority: exact match → fuzzy match (with guards for ambiguous fields).
  * Returns the field key or null if no match.
  * @param {string} rawHeader
  * @returns {string|null}
  */
 function detectColumnField(rawHeader) {
   const normalized = normalizeHeader(rawHeader);
+
+  // 1. Exact match — highest priority, no guards needed
   for (const [field, aliases] of Object.entries(COLUMN_ALIASES)) {
     for (const alias of aliases) {
       if (normalizeHeader(alias) === normalized) {
@@ -89,8 +113,15 @@ function detectColumnField(rawHeader) {
       }
     }
   }
-  // Fuzzy: partial match
+
+  // 2. Fuzzy / partial match — with field-specific guards
   for (const [field, aliases] of Object.entries(COLUMN_ALIASES)) {
+    // Guard: never fuzzy-match totalAmount when header contains delivery/shipping words
+    if (field === 'totalAmount') {
+      const isDeliveryRelated = TOTAL_AMOUNT_BLOCKLIST.some(word => normalized.includes(word));
+      if (isDeliveryRelated) continue;
+    }
+
     for (const alias of aliases) {
       const normAlias = normalizeHeader(alias);
       if (normalized.includes(normAlias) || normAlias.includes(normalized)) {
@@ -98,6 +129,7 @@ function detectColumnField(rawHeader) {
       }
     }
   }
+
   return null;
 }
 
@@ -134,23 +166,144 @@ function parseFileBuffer(buffer, mimetype) {
 }
 
 /**
- * AI Column Detection - maps file headers to CONFIRMED standard fields.
+ * Detect column mappings with confidence scores for all headers.
+ *
+ * Returns:
+ *  - columnMapping:   { confirmedField: rawHeader }  — backward-compat simple map
+ *  - mappingDetails:  array of { rawHeader, confirmedField|null, confidence 0-100, allScores }
+ *  - unmappedHeaders: headers that scored below the threshold for every field
+ *
+ * Algorithm:
+ *  Pass 1 — score every header against every field.
+ *  Pass 2 — assign fields greedily by highest score, one field per header.
+ *  Confidence = score / 100 clamped, plus a small bonus for being unambiguous.
+ *
  * @param {string[]} headers
- * @returns {object} mapping: { confirmedField: rawHeader }
+ * @returns {{ columnMapping, mappingDetails, unmappedHeaders }}
  */
-function detectColumnMapping(headers) {
-  const mapping = {};
-  const usedHeaders = new Set();
-  
-  for (const header of headers) {
-    const field = detectColumnField(header);
-    if (field && !mapping[field]) {
-      mapping[field] = header;
-      usedHeaders.add(header);
+function detectColumnMappingWithScores(headers) {
+  const MIN_SCORE = 40; // below this → unmapped
+
+  // Step 1: compute raw score for every (header, field) pair
+  // scores[headerIdx][field] = 0–100
+  const rawScores = headers.map(header => {
+    const normalized = normalizeHeader(header);
+    const fieldScores = {};
+    for (const [field, aliases] of Object.entries(COLUMN_ALIASES)) {
+      let best = 0;
+
+      // Exact match → 100
+      for (const alias of aliases) {
+        if (normalizeHeader(alias) === normalized) { best = 100; break; }
+      }
+
+      if (best < 100) {
+        // Fuzzy — blocked for totalAmount if header contains delivery words
+        if (field === 'totalAmount') {
+          const blocked = TOTAL_AMOUNT_BLOCKLIST.some(w => normalized.includes(normalizeHeader(w)));
+          if (blocked) { fieldScores[field] = 0; continue; }
+        }
+
+        for (const alias of aliases) {
+          const normAlias = normalizeHeader(alias);
+          if (normalized.includes(normAlias) || normAlias.includes(normalized)) {
+            // Score based on how specific the match is
+            // Prefer longer alias matches (more tokens = more specific)
+            const aliasTokens = normAlias.split(/\s+/).length;
+            const headerTokens = normalized.split(/\s+/).length;
+            const specificity = Math.min(aliasTokens, headerTokens);
+            const score = 40 + Math.min(specificity * 10, 40); // 40–80
+            if (score > best) best = score;
+          }
+        }
+      }
+
+      fieldScores[field] = best;
+    }
+    return fieldScores;
+  });
+
+  // Step 2: greedy assignment — process fields in priority order
+  // Each header can only claim one field; each field can only be claimed once
+  const FIELD_PRIORITY = [
+    'deliveryCost', 'orderId', 'clientPhone', 'clientName',
+    'totalAmount', 'productName', 'quantity',
+    'region', 'city', 'address', 'notes'
+  ];
+
+  const claimedHeaders = new Set();  // headerIdx
+  const claimedFields  = new Set();  // field
+
+  // fieldWinner[field] = { headerIdx, score }
+  const fieldWinner = {};
+
+  for (const field of FIELD_PRIORITY) {
+    let bestIdx = -1, bestScore = 0;
+    headers.forEach((_, idx) => {
+      if (claimedHeaders.has(idx)) return;
+      const score = rawScores[idx][field] ?? 0;
+      if (score > bestScore && score >= MIN_SCORE) {
+        bestScore = score;
+        bestIdx = idx;
+      }
+    });
+    if (bestIdx >= 0) {
+      fieldWinner[field] = { headerIdx: bestIdx, score: bestScore };
+      claimedHeaders.add(bestIdx);
+      claimedFields.add(field);
     }
   }
-  
-  return mapping;
+
+  // Step 3: build output structures
+  const columnMapping = {};
+  const mappingDetails = headers.map((rawHeader, idx) => {
+    // Find if this header was assigned to a field
+    const assignedField = Object.entries(fieldWinner).find(
+      ([, v]) => v.headerIdx === idx
+    )?.[0] ?? null;
+
+    const score = assignedField ? fieldWinner[assignedField].score : 0;
+
+    // Confidence: normalize score to 0–100, penalise fuzzy matches slightly
+    let confidence = score;
+    if (score > 0 && score < 100) {
+      // Reduce confidence for partial matches — exact=100, fuzzy=40–80
+      confidence = Math.round(score * 0.9); // mild penalty, keeps it honest
+    }
+
+    // Build allScores map for extensibility / debugging
+    const allScores = {};
+    for (const field of FIELD_PRIORITY) {
+      const s = rawScores[idx][field] ?? 0;
+      if (s > 0) allScores[field] = s;
+    }
+
+    if (assignedField) {
+      columnMapping[assignedField] = rawHeader;
+    }
+
+    return {
+      rawHeader,
+      confirmedField: assignedField,
+      confidence,     // 0-100
+      allScores,      // { field: score } for all non-zero fields
+    };
+  });
+
+  const unmappedHeaders = mappingDetails
+    .filter(d => d.confirmedField === null)
+    .map(d => d.rawHeader);
+
+  return { columnMapping, mappingDetails, unmappedHeaders };
+}
+
+/**
+ * Detect column mappings (simple version, backward-compat).
+ * @param {string[]} headers
+ * @returns {object} { confirmedField: rawHeader }
+ */
+function detectColumnMapping(headers) {
+  return detectColumnMappingWithScores(headers).columnMapping;
 }
 
 /**
@@ -415,7 +568,7 @@ async function processImport(fileBuffer, mimetype, options = {}) {
   }
   
   // 2. AI column detection
-  const columnMapping = detectColumnMapping(headers);
+  const { columnMapping, mappingDetails, unmappedHeaders } = detectColumnMappingWithScores(headers);
   
   // 3. Map all rows to CONFIRMED fields
   const mappedRows = rows.map(r => applyMapping(r, columnMapping));
@@ -475,6 +628,8 @@ async function processImport(fileBuffer, mimetype, options = {}) {
       totalRejected: rejectedCount,
       totalDuplicates: duplicateCount,
       columnMapping,
+      mappingDetails,
+      unmappedHeaders,
       headers,
       insights,
       previewRows
@@ -533,6 +688,8 @@ async function processImport(fileBuffer, mimetype, options = {}) {
     totalDuplicates: duplicateCount,
     errorsDetected: rejectedCount,
     columnMapping,
+    mappingDetails,
+    unmappedHeaders,
     insights,
     previewRows,
     importedOrderIds: importedOrders
@@ -542,6 +699,7 @@ async function processImport(fileBuffer, mimetype, options = {}) {
 module.exports = {
   parseFileBuffer,
   detectColumnMapping,
+  detectColumnMappingWithScores,
   detectColumnField,
   validateRow,
   generateInsights,
