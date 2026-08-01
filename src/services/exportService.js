@@ -394,6 +394,94 @@ class ExportService {
       throw error;
     }
   }
+
+  // ─── YALIDINE EXPORT ───────────────────────────────────────────────────────
+
+  /**
+   * Map a single order to a Yalidine row object.
+   * Columns (in order): Tracking, Nom, Téléphone, Adresse, Wilaya, Commune, Montant, Produit
+   *
+   * Field mapping:
+   *   Tracking → order.deliveryInfo.trackingNumber → order.orderId
+   *   Nom      → clientInfo.name
+   *   Téléphone → clientInfo.phone
+   *   Adresse  → buildAddress(clientInfo.address)
+   *   Wilaya   → clientInfo.address.state → order.region
+   *   Commune  → clientInfo.address.city
+   *   Montant  → totalAmount
+   *   Produit  → formatItems(items)
+   *
+   * Note: Order.js has no top-level trackingNumber field.
+   * The only tracking field is deliveryInfo.trackingNumber.
+   *
+   * @param {Object} order
+   * @returns {Object}
+   */
+  static mapOrderToYalidine(order) {
+    const address  = order.clientInfo?.address || {};
+    const tracking = order.deliveryInfo?.trackingNumber || order.orderId || '';
+    const wilaya   = address.state || order.region || '';
+    return {
+      'Tracking':  tracking,
+      'Nom':       order.clientInfo?.name  || '',
+      'Téléphone': order.clientInfo?.phone || '',
+      'Adresse':   ExportService.buildAddress(address),
+      'Wilaya':    wilaya,
+      'Commune':   address.city            || '',
+      'Montant':   order.totalAmount != null ? order.totalAmount : '',
+      'Produit':   ExportService.formatItems(order.items)
+    };
+  }
+
+  /**
+   * Export selected orders in Yalidine format as CSV.
+   * Headers: Tracking,Nom,Téléphone,Adresse,Wilaya,Commune,Montant,Produit
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<string>} CSV string (UTF-8 BOM for Excel)
+   */
+  async exportYalidineCSV(orderIds, user) {
+    try {
+      const orders  = await this.fetchOrdersForExport(orderIds, user);
+      const headers = ['Tracking', 'Nom', 'Téléphone', 'Adresse', 'Wilaya', 'Commune', 'Montant', 'Produit'];
+      const rows = orders.map(order => {
+        const row = ExportService.mapOrderToYalidine(order);
+        return headers.map(h => escapeCSVField(row[h])).join(',');
+      });
+      return '\uFEFF' + [headers.map(escapeCSVField).join(','), ...rows].join('\n');
+    } catch (error) {
+      logger.error('Error exporting Yalidine CSV:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Export selected orders in Yalidine format as XLSX.
+   * Sheet name: Yalidine
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<Buffer>} XLSX buffer
+   */
+  async exportYalidineXLSX(orderIds, user) {
+    try {
+      const orders  = await this.fetchOrdersForExport(orderIds, user);
+      const headers = ['Tracking', 'Nom', 'Téléphone', 'Adresse', 'Wilaya', 'Commune', 'Montant', 'Produit'];
+      const data = [
+        headers,
+        ...orders.map(order => {
+          const row = ExportService.mapOrderToYalidine(order);
+          return headers.map(h => row[h]);
+        })
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Yalidine');
+      return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    } catch (error) {
+      logger.error('Error exporting Yalidine XLSX:', error);
+      throw error;
+    }
+  }
 }
 
 module.exports = new ExportService();
