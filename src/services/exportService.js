@@ -218,6 +218,7 @@ class ExportService {
         })
       ];
       const ws = XLSX.utils.aoa_to_sheet(data);
+      ExportService.autoSizeWorksheetColumns(ws, data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, 'Intigo');
       return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -298,6 +299,7 @@ class ExportService {
         })
       ];
       const ws = XLSX.utils.aoa_to_sheet(data);
+      ExportService.autoSizeWorksheetColumns(ws, data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, 'Aramex');
       return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -386,6 +388,7 @@ class ExportService {
         })
       ];
       const ws = XLSX.utils.aoa_to_sheet(data);
+      ExportService.autoSizeWorksheetColumns(ws, data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, 'Rapid Poste');
       return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -474,6 +477,7 @@ class ExportService {
         })
       ];
       const ws = XLSX.utils.aoa_to_sheet(data);
+      ExportService.autoSizeWorksheetColumns(ws, data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, 'Yalidine');
       return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -542,6 +546,35 @@ class ExportService {
     if (isNaN(d.getTime())) return '';
     const pad = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  /**
+   * Auto-size every column in a SheetJS worksheet based on the longest cell
+   * value in each column (header included).
+   *
+   * Rules:
+   *   - width = max cell length across all rows + 2 chars padding
+   *   - minimum width: 12
+   *   - maximum width: 40
+   *
+   * @param {Object}     ws   - SheetJS worksheet (mutated in-place)
+   * @param {Array[]}    data - 2-D array used to build the worksheet (row 0 = headers)
+   */
+  static autoSizeWorksheetColumns(ws, data) {
+    if (!data || data.length === 0) return;
+    const colCount = data[0].length;
+    const colWidths = [];
+    for (let c = 0; c < colCount; c++) {
+      let maxLen = 0;
+      for (const row of data) {
+        const cell = row[c];
+        const len  = cell != null ? String(cell).length : 0;
+        if (len > maxLen) maxLen = len;
+      }
+      const width = Math.min(40, Math.max(12, maxLen + 2));
+      colWidths.push({ wch: width });
+    }
+    ws['!cols'] = colWidths;
   }
 
   /**
@@ -640,6 +673,7 @@ class ExportService {
         })
       ];
       const ws = XLSX.utils.aoa_to_sheet(data);
+      ExportService.autoSizeWorksheetColumns(ws, data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, 'Custom');
       return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
