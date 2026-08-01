@@ -306,6 +306,94 @@ class ExportService {
       throw error;
     }
   }
+  // ─── RAPID POSTE EXPORT ────────────────────────────────────────────────────
+
+  /**
+   * Map a single order to a Rapid Poste row object.
+   * Columns (in order): N° Commande, Destinataire, Téléphone,
+   *                     Adresse Livraison, Code Postal, Gouvernorat, Montant COD
+   *
+   * Field mapping:
+   *   N° Commande      → order.orderId
+   *   Destinataire     → clientInfo.name
+   *   Téléphone        → clientInfo.phone
+   *   Adresse Livraison → buildAddress(clientInfo.address)
+   *   Code Postal      → clientInfo.address.zipCode
+   *   Gouvernorat      → clientInfo.address.state → order.region → clientInfo.address.city
+   *   Montant COD      → totalAmount
+   *
+   * @param {Object} order
+   * @returns {Object}
+   */
+  static mapOrderToRapidPoste(order) {
+    const address = order.clientInfo?.address || {};
+    const gouvernorat = address.state || order.region || address.city || '';
+    return {
+      'N° Commande':       order.orderId                           || '',
+      'Destinataire':      order.clientInfo?.name                  || '',
+      'Téléphone':         order.clientInfo?.phone                 || '',
+      'Adresse Livraison': ExportService.buildAddress(address),
+      'Code Postal':       address.zipCode                         || '',
+      'Gouvernorat':       gouvernorat,
+      'Montant COD':       order.totalAmount != null ? order.totalAmount : ''
+    };
+  }
+
+  /**
+   * Export selected orders in Rapid Poste format as CSV.
+   * Headers: N° Commande,Destinataire,Téléphone,Adresse Livraison,Code Postal,Gouvernorat,Montant COD
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<string>} CSV string (UTF-8 BOM for Excel)
+   */
+  async exportRapidPosteCSV(orderIds, user) {
+    try {
+      const orders  = await this.fetchOrdersForExport(orderIds, user);
+      const headers = [
+        'N° Commande', 'Destinataire', 'Téléphone',
+        'Adresse Livraison', 'Code Postal', 'Gouvernorat', 'Montant COD'
+      ];
+      const rows = orders.map(order => {
+        const row = ExportService.mapOrderToRapidPoste(order);
+        return headers.map(h => escapeCSVField(row[h])).join(',');
+      });
+      return '\uFEFF' + [headers.map(escapeCSVField).join(','), ...rows].join('\n');
+    } catch (error) {
+      logger.error('Error exporting Rapid Poste CSV:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Export selected orders in Rapid Poste format as XLSX.
+   * Sheet name: Rapid Poste
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<Buffer>} XLSX buffer
+   */
+  async exportRapidPosteXLSX(orderIds, user) {
+    try {
+      const orders  = await this.fetchOrdersForExport(orderIds, user);
+      const headers = [
+        'N° Commande', 'Destinataire', 'Téléphone',
+        'Adresse Livraison', 'Code Postal', 'Gouvernorat', 'Montant COD'
+      ];
+      const data = [
+        headers,
+        ...orders.map(order => {
+          const row = ExportService.mapOrderToRapidPoste(order);
+          return headers.map(h => row[h]);
+        })
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Rapid Poste');
+      return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    } catch (error) {
+      logger.error('Error exporting Rapid Poste XLSX:', error);
+      throw error;
+    }
+  }
 }
 
 module.exports = new ExportService();

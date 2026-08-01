@@ -454,8 +454,8 @@ router.get('/import/history', auth, async (req, res, next) => {
  * Export orders in a logistics-provider-specific format.
  * Body: { provider: string, fileType: "csv"|"xlsx", orderIds?: string[] }
  *
- * Supported providers: generic, intigo, aramex
- * Unsupported providers: rapid_poste, custom, yalidine → 422 "not configured yet"
+ * Supported providers: generic, intigo, aramex, rapid_poste
+ * Unsupported providers: custom, yalidine → 422 "not configured yet"
  */
 router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res, next) => {
   try {
@@ -527,6 +527,24 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportAramexXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="aramex-export.xlsx"');
+      return res.send(buf);
+    }
+
+    // ── Rapid Poste export ───────────────────────────────────────────────────
+    if (normalizedProvider === 'rapid_poste') {
+      const ids = Array.isArray(orderIds) ? orderIds : [];
+
+      if (normalizedFileType === 'csv') {
+        const csv = await exportService.exportRapidPosteCSV(ids, req.user);
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="rapid-poste-export.csv"');
+        return res.send(csv);
+      }
+
+      // xlsx
+      const buf = await exportService.exportRapidPosteXLSX(ids, req.user);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', 'attachment; filename="rapid-poste-export.xlsx"');
       return res.send(buf);
     }
 
