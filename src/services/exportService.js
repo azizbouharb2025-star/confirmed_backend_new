@@ -226,6 +226,86 @@ class ExportService {
       throw error;
     }
   }
+
+  // ─── ARAMEX EXPORT ─────────────────────────────────────────────────────────
+
+  /**
+   * Map a single order to an Aramex row object.
+   * Columns: Nom, Téléphone, Adresse, Gouvernorat, Produit, COD
+   *
+   * Field mapping:
+   *   Nom         → clientInfo.name
+   *   Téléphone   → clientInfo.phone
+   *   Adresse     → buildAddress(clientInfo.address)
+   *   Gouvernorat → clientInfo.address.state → order.region → clientInfo.address.city
+   *   Produit     → formatItems(items)
+   *   COD         → totalAmount
+   *
+   * @param {Object} order
+   * @returns {Object}
+   */
+  static mapOrderToAramex(order) {
+    const address = order.clientInfo?.address || {};
+    const gouvernorat = address.state || order.region || address.city || '';
+    return {
+      'Nom':         order.clientInfo?.name  || '',
+      'Téléphone':   order.clientInfo?.phone || '',
+      'Adresse':     ExportService.buildAddress(address),
+      'Gouvernorat': gouvernorat,
+      'Produit':     ExportService.formatItems(order.items),
+      'COD':         order.totalAmount != null ? order.totalAmount : ''
+    };
+  }
+
+  /**
+   * Export selected orders in Aramex format as CSV.
+   * Headers: Nom,Téléphone,Adresse,Gouvernorat,Produit,COD
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<string>} CSV string (UTF-8 BOM for Excel)
+   */
+  async exportAramexCSV(orderIds, user) {
+    try {
+      const orders = await this.fetchOrdersForExport(orderIds, user);
+      const headers = ['Nom', 'Téléphone', 'Adresse', 'Gouvernorat', 'Produit', 'COD'];
+      const rows = orders.map(order => {
+        const row = ExportService.mapOrderToAramex(order);
+        return headers.map(h => escapeCSVField(row[h])).join(',');
+      });
+      return '\uFEFF' + [headers.map(escapeCSVField).join(','), ...rows].join('\n');
+    } catch (error) {
+      logger.error('Error exporting Aramex CSV:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Export selected orders in Aramex format as XLSX.
+   * Sheet name: Aramex
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<Buffer>} XLSX buffer
+   */
+  async exportAramexXLSX(orderIds, user) {
+    try {
+      const orders = await this.fetchOrdersForExport(orderIds, user);
+      const headers = ['Nom', 'Téléphone', 'Adresse', 'Gouvernorat', 'Produit', 'COD'];
+      const data = [
+        headers,
+        ...orders.map(order => {
+          const row = ExportService.mapOrderToAramex(order);
+          return headers.map(h => row[h]);
+        })
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Aramex');
+      return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    } catch (error) {
+      logger.error('Error exporting Aramex XLSX:', error);
+      throw error;
+    }
+  }
 }
 
 module.exports = new ExportService();
