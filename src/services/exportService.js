@@ -1,5 +1,6 @@
 const orderService = require('./orderService');
 const logger = require('../utils/logger');
+const XLSX = require('xlsx');
 
 /**
  * CSV field escaping - handles quotes, commas, and newlines
@@ -107,6 +108,123 @@ class ExportService {
     };
     const result = await orderService.findOrders(exportFilters, user);
     return result.orders;
+  }
+
+  // ─── INTIGO EXPORT HELPERS ─────────────────────────────────────────────────
+
+  /**
+   * Build a clean address string from an order's clientInfo.address.
+   * Skips null/undefined/empty parts so the output never contains "undefined".
+   * @param {Object} address - clientInfo.address
+   * @returns {string}
+   */
+  static buildAddress(address) {
+    if (!address) return '';
+    const parts = [address.street, address.city].filter(v => v && v.trim() !== '');
+    return parts.join(', ');
+  }
+
+  /**
+   * Format an order's items array into a readable product string.
+   * e.g. "T-Shirt x2 | Pants x1"
+   * @param {Array} items
+   * @returns {string}
+   */
+  static formatItems(items) {
+    if (!Array.isArray(items) || items.length === 0) return '';
+    return items
+      .map(item => {
+        const name = (item.name || '').trim();
+        const qty = item.quantity || 1;
+        return name ? `${name} x${qty}` : `x${qty}`;
+      })
+      .filter(s => s)
+      .join(' | ');
+  }
+
+  /**
+   * Map a single order to an Intigo row object.
+   * Columns: Nom, Téléphone, Adresse, Ville, Montant, Produit
+   * @param {Object} order
+   * @returns {Object}
+   */
+  static mapOrderToIntigo(order) {
+    const address = order.clientInfo?.address || {};
+    return {
+      'Nom':       order.clientInfo?.name    || '',
+      'Téléphone': order.clientInfo?.phone   || '',
+      'Adresse':   ExportService.buildAddress(address),
+      'Ville':     address.city              || order.region || '',
+      'Montant':   order.totalAmount         != null ? order.totalAmount : '',
+      'Produit':   ExportService.formatItems(order.items)
+    };
+  }
+
+  /**
+   * Fetch orders by IDs (scoped to the requesting user's shop).
+   * @param {string[]} orderIds  - Optional explicit list; if empty, fetches all for shop.
+   * @param {Object}   user
+   * @returns {Promise<Array>}
+   */
+  async fetchOrdersForExport(orderIds, user) {
+    const filters = { page: 1, limit: 10000 };
+    const result = await orderService.findOrders(filters, user);
+    let orders = result.orders;
+    if (Array.isArray(orderIds) && orderIds.length > 0) {
+      const idSet = new Set(orderIds.map(String));
+      orders = orders.filter(o => idSet.has(String(o._id)));
+    }
+    return orders;
+  }
+
+  /**
+   * Export selected orders in Intigo format as CSV.
+   * Headers: Nom,Téléphone,Adresse,Ville,Montant,Produit
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<string>} CSV string (UTF-8, with BOM for Excel)
+   */
+  async exportIntigoCSV(orderIds, user) {
+    try {
+      const orders = await this.fetchOrdersForExport(orderIds, user);
+      const headers = ['Nom', 'Téléphone', 'Adresse', 'Ville', 'Montant', 'Produit'];
+      const rows = orders.map(order => {
+        const row = ExportService.mapOrderToIntigo(order);
+        return headers.map(h => escapeCSVField(row[h])).join(',');
+      });
+      // UTF-8 BOM so Excel opens it correctly
+      return '\uFEFF' + [headers.map(escapeCSVField).join(','), ...rows].join('\n');
+    } catch (error) {
+      logger.error('Error exporting Intigo CSV:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Export selected orders in Intigo format as XLSX.
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @returns {Promise<Buffer>} XLSX buffer
+   */
+  async exportIntigoXLSX(orderIds, user) {
+    try {
+      const orders = await this.fetchOrdersForExport(orderIds, user);
+      const headers = ['Nom', 'Téléphone', 'Adresse', 'Ville', 'Montant', 'Produit'];
+      const data = [
+        headers,
+        ...orders.map(order => {
+          const row = ExportService.mapOrderToIntigo(order);
+          return headers.map(h => row[h]);
+        })
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Intigo');
+      return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    } catch (error) {
+      logger.error('Error exporting Intigo XLSX:', error);
+      throw error;
+    }
   }
 }
 

@@ -539,6 +539,7 @@ function rowToOrderPayload(row, shopId) {
  * @param {string} options.shopId
  * @param {string} options.userId
  * @param {string} options.fileName
+ * @param {number} [options.fileSize]        - original file size in bytes (optional)
  * @param {string} options.duplicateAction - 'ignore'|'import'|'merge'
  * @param {boolean} options.dryRun - if true, don't actually save
  * @param {object} options.Order - Mongoose Order model
@@ -550,6 +551,7 @@ async function processImport(fileBuffer, mimetype, options = {}) {
     shopId,
     userId,
     fileName,
+    fileSize = null,
     duplicateAction = 'ignore',
     dryRun = false,
     Order,
@@ -656,19 +658,32 @@ async function processImport(fileBuffer, mimetype, options = {}) {
     }
   }
   
-  // 9. Save import history
+  // 9. Save import history — non-blocking: a history failure must never undo
+  //    already-imported orders or change the success response.
   try {
+    // Determine import status:
+    //   completed — every importable row (valid/warning) was saved successfully
+    //   partial   — at least one order was saved but some DB inserts failed
+    //   failed    — nothing was imported (all rows rejected/duplicate + no saves)
+    let importStatus = 'completed';
+    if (importedOrders.length === 0) {
+      importStatus = 'failed';
+    } else if (importErrors.length > 0) {
+      importStatus = 'partial';
+    }
+
     await ImportHistory.create({
       shopId,
       userId,
       fileName,
       fileType: fileName.toLowerCase().endsWith('.csv') ? 'csv' : 'xlsx',
+      fileSize: (typeof fileSize === 'number' && fileSize > 0) ? fileSize : null,
       totalDetected: rows.length,
       totalImported: importedOrders.length,
       totalRejected: rejectedCount + importErrors.length,
       totalDuplicates: duplicateCount,
       errorsDetected: rejectedCount,
-      status: 'completed',
+      status: importStatus,
       errorDetails: importErrors.map(e => ({
         row: e.row,
         field: 'general',
@@ -676,7 +691,13 @@ async function processImport(fileBuffer, mimetype, options = {}) {
       }))
     });
   } catch (histErr) {
-    logger.warn('Failed to save import history:', histErr.message);
+    // Log clearly but do not re-throw — the orders were already saved successfully
+    logger.error('ImportHistory: failed to save record after confirmed import', {
+      fileName,
+      shopId,
+      userId,
+      error: histErr.message
+    });
   }
   
   return {

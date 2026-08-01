@@ -366,6 +366,7 @@ router.post(
           shopId: req.user.shopId,
           userId: req.user._id,
           fileName: req.file.originalname,
+          fileSize: req.file.size,
           duplicateAction: req.body.duplicateAction || 'ignore',
           dryRun: false,
           Order,
@@ -382,28 +383,64 @@ router.post(
 
 /**
  * GET /api/orders/import/history
- * Get import history for the current shop owner.
+ * Return paginated import history.
+ *
+ * Permissions:
+ *   shop_owner  — sees only their own shop's history (enforced by req.user.shopId)
+ *   admin       — may pass ?shopId=<id> to filter by shop, or omit to see all
+ *   operator    — forbidden (403)
+ *
+ * Query params:
+ *   page  (default 1)
+ *   limit (default 10, max 100)
+ *   shopId (admin only — ignored for shop_owner)
  */
-router.get('/import/history', auth, authorize('shop_owner'), async (req, res, next) => {
+router.get('/import/history', auth, async (req, res, next) => {
   try {
-    const { page = 1, limit = 20 } = req.query;
-    const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const { role, shopId: userShopId } = req.user;
+
+    // Operators have no access to import history
+    if (role === 'operator') {
+      return res.status(403).json({ error: 'Access denied. Insufficient permissions.' });
+    }
+
+    const page  = Math.max(1, parseInt(req.query.page,  10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
+    const skip  = (page - 1) * limit;
+
+    // Build the query scope — shop_owner is always restricted to their own shop
+    const query = {};
+    if (role === 'shop_owner') {
+      // Never trust a shopId from the query string for non-admins
+      query.shopId = userShopId;
+    } else if (role === 'admin') {
+      // Admin may optionally filter by a specific shop
+      if (req.query.shopId) {
+        query.shopId = req.query.shopId;
+      }
+      // No shopId filter → admin sees all shops
+    }
 
     const [history, total] = await Promise.all([
-      ImportHistory.find({ shopId: req.user.shopId })
+      ImportHistory.find(query)
         .sort({ createdAt: -1 })
-        .skip((pageNum - 1) * limitNum)
-        .limit(limitNum)
+        .skip(skip)
+        .limit(limit)
+        .select('-errorDetails')   // keep the list response lean
+        .populate('userId', 'firstName lastName email')
         .lean(),
-      ImportHistory.countDocuments({ shopId: req.user.shopId })
+      ImportHistory.countDocuments(query)
     ]);
 
     res.json({
+      success: true,
       history,
-      total,
-      page: pageNum,
-      totalPages: Math.ceil(total / limitNum)
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
     });
   } catch (error) {
     next(error);
@@ -411,6 +448,78 @@ router.get('/import/history', auth, authorize('shop_owner'), async (req, res, ne
 });
 
 // ─── DELIVERY EXPORT MODULE ────────────────────────────────────────────────────
+
+/**
+ * POST /api/orders/export/logistics
+ * Export orders in a logistics-provider-specific format.
+ * Body: { provider: string, fileType: "csv"|"xlsx", orderIds?: string[] }
+ *
+ * Supported providers: generic, intigo
+ * Unsupported providers: aramex, rapid_poste, custom → 422 "not configured yet"
+ */
+router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const { provider = 'generic', fileType = 'csv', orderIds } = req.body;
+
+    const normalizedProvider = String(provider).toLowerCase().trim();
+    const normalizedFileType = String(fileType).toLowerCase().trim();
+
+    if (!['csv', 'xlsx'].includes(normalizedFileType)) {
+      return res.status(400).json({ error: 'fileType must be "csv" or "xlsx"' });
+    }
+
+    // ── Generic export ──────────────────────────────────────────────────────
+    if (normalizedProvider === 'generic') {
+      const filters = { orderIds };
+      const csv = await exportService.exportOrdersToCSV(filters, req.user);
+      const filename = `generic-export.${normalizedFileType}`;
+
+      if (normalizedFileType === 'csv') {
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(csv);
+      }
+      // XLSX for generic: convert CSV to XLSX via SheetJS
+      const XLSX = require('xlsx');
+      const ws = XLSX.utils.aoa_to_sheet(
+        csv.split('\n').map(row =>
+          row.split(',').map(cell => cell.replace(/^"|"$/g, '').replace(/""/g, '"'))
+        )
+      );
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Orders');
+      const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(buf);
+    }
+
+    // ── Intigo export ───────────────────────────────────────────────────────
+    if (normalizedProvider === 'intigo') {
+      const ids = Array.isArray(orderIds) ? orderIds : [];
+
+      if (normalizedFileType === 'csv') {
+        const csv = await exportService.exportIntigoCSV(ids, req.user);
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="intigo-export.csv"');
+        return res.send(csv);
+      }
+
+      // xlsx
+      const buf = await exportService.exportIntigoXLSX(ids, req.user);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', 'attachment; filename="intigo-export.xlsx"');
+      return res.send(buf);
+    }
+
+    // ── Unsupported providers ───────────────────────────────────────────────
+    return res.status(422).json({
+      error: `Provider "${provider}" is not configured yet`
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 /**
  * GET /api/orders/ready-to-ship
