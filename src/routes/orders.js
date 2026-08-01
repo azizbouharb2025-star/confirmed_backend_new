@@ -3,6 +3,7 @@ const Joi = require('joi');
 const multer = require('multer');
 const Order = require('../models/Order');
 const ImportHistory = require('../models/ImportHistory');
+const ExportTemplate = require('../models/ExportTemplate');
 const { auth, authorize } = require('../middleware/auth');
 const { getRedisClient } = require('../config/redis');
 const orderService = require('../services/orderService');
@@ -448,6 +449,229 @@ router.get('/import/history', auth, async (req, res, next) => {
 });
 
 // ─── DELIVERY EXPORT MODULE ────────────────────────────────────────────────────
+
+// ─── EXPORT TEMPLATE MODULE ───────────────────────────────────────────────────
+
+/**
+ * GET /api/orders/export/templates
+ * List all saved custom-export templates for the authenticated shop owner.
+ *
+ * Permissions: shop_owner only.
+ * Returns templates ordered by most recently created first.
+ */
+router.get('/export/templates', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const templates = await ExportTemplate.find({ shopId: req.user.shopId })
+      .sort({ createdAt: -1 })
+      .select('-__v')
+      .lean();
+
+    res.json({ success: true, templates });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/orders/export/templates
+ * Create a new named custom-export template for the authenticated shop.
+ *
+ * Body: { name, columns, isDefault? }
+ *
+ * Validation:
+ *   - name required, 1-100 chars
+ *   - columns: non-empty array, valid keys, no duplicates
+ *   - duplicate name within same shop → 409
+ *   - if isDefault true → clears any existing default first
+ */
+router.post('/export/templates', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const { name, columns, isDefault = false } = req.body;
+
+    // ── name validation ───────────────────────────────────────────────────────
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    if (name.trim().length > 100) {
+      return res.status(400).json({ error: 'name must be 100 characters or fewer' });
+    }
+
+    // ── columns validation (reuse ExportService logic) ────────────────────────
+    const colError = ExportTemplate.validateColumns(columns)
+      ? null
+      : buildColumnError(columns);
+    if (colError) return res.status(400).json({ error: colError });
+
+    // ── duplicate name check ──────────────────────────────────────────────────
+    const existing = await ExportTemplate.findOne({
+      shopId: req.user.shopId,
+      name:   name.trim()
+    });
+    if (existing) {
+      return res.status(409).json({
+        error: `A template named "${name.trim()}" already exists for this shop`
+      });
+    }
+
+    // ── if setting as default, unset all current defaults first ──────────────
+    if (isDefault) {
+      await ExportTemplate.updateMany(
+        { shopId: req.user.shopId, isDefault: true },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    const template = await ExportTemplate.create({
+      shopId:    req.user.shopId,
+      userId:    req.user._id,
+      name:      name.trim(),
+      columns,
+      isDefault: Boolean(isDefault)
+    });
+
+    res.status(201).json({ success: true, template });
+  } catch (error) {
+    // Catch MongoDB duplicate-key error as a safety net
+    if (error.code === 11000) {
+      return res.status(409).json({
+        error: 'A template with that name already exists for this shop'
+      });
+    }
+    next(error);
+  }
+});
+
+/**
+ * PUT /api/orders/export/templates/:id
+ * Update an existing template's name, columns, and/or isDefault flag.
+ *
+ * Permissions: shop_owner, own shop only.
+ * Body: { name?, columns?, isDefault? }  — all optional, at least one required.
+ */
+router.put('/export/templates/:id', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const template = await ExportTemplate.findById(req.params.id);
+
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+
+    // ── shop isolation ────────────────────────────────────────────────────────
+    if (String(template.shopId) !== String(req.user.shopId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const updates = {};
+
+    // ── name update ───────────────────────────────────────────────────────────
+    if (req.body.name !== undefined) {
+      const newName = String(req.body.name).trim();
+      if (newName.length === 0) {
+        return res.status(400).json({ error: 'name cannot be empty' });
+      }
+      if (newName.length > 100) {
+        return res.status(400).json({ error: 'name must be 100 characters or fewer' });
+      }
+      // Check for duplicate name (excluding this template)
+      const dupe = await ExportTemplate.findOne({
+        shopId: req.user.shopId,
+        name:   newName,
+        _id:    { $ne: template._id }
+      });
+      if (dupe) {
+        return res.status(409).json({
+          error: `A template named "${newName}" already exists for this shop`
+        });
+      }
+      updates.name = newName;
+    }
+
+    // ── columns update ────────────────────────────────────────────────────────
+    if (req.body.columns !== undefined) {
+      const colError = ExportTemplate.validateColumns(req.body.columns)
+        ? null
+        : buildColumnError(req.body.columns);
+      if (colError) return res.status(400).json({ error: colError });
+      updates.columns = req.body.columns;
+    }
+
+    // ── isDefault update ──────────────────────────────────────────────────────
+    if (req.body.isDefault !== undefined) {
+      const becomesDefault = Boolean(req.body.isDefault);
+      if (becomesDefault) {
+        await ExportTemplate.updateMany(
+          { shopId: req.user.shopId, isDefault: true, _id: { $ne: template._id } },
+          { $set: { isDefault: false } }
+        );
+      }
+      updates.isDefault = becomesDefault;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const updated = await ExportTemplate.findByIdAndUpdate(
+      template._id,
+      { $set: updates },
+      { new: true, runValidators: true, select: '-__v' }
+    );
+
+    res.json({ success: true, template: updated });
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(409).json({
+        error: 'A template with that name already exists for this shop'
+      });
+    }
+    next(error);
+  }
+});
+
+/**
+ * DELETE /api/orders/export/templates/:id
+ * Delete a template. Only the owning shop can delete it.
+ */
+router.delete('/export/templates/:id', auth, authorize('shop_owner'), async (req, res, next) => {
+  try {
+    const template = await ExportTemplate.findById(req.params.id);
+
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+
+    // ── shop isolation ────────────────────────────────────────────────────────
+    if (String(template.shopId) !== String(req.user.shopId)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    await ExportTemplate.findByIdAndDelete(template._id);
+
+    res.json({ success: true, message: 'Template deleted' });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── Helper: build a human-readable column error message ─────────────────────
+
+function buildColumnError(columns) {
+  const { ALLOWED_COLUMN_KEYS } = ExportTemplate;
+  if (!Array.isArray(columns)) return 'columns must be an array';
+  if (columns.length === 0)    return 'columns must contain at least one column';
+  const invalid = columns.filter(c => !ALLOWED_COLUMN_KEYS.includes(c));
+  if (invalid.length > 0) {
+    return `Invalid column key(s): ${invalid.join(', ')}. Allowed: ${ALLOWED_COLUMN_KEYS.join(', ')}`;
+  }
+  const seen = new Set();
+  for (const col of columns) {
+    if (seen.has(col)) return `Duplicate column key: ${col}`;
+    seen.add(col);
+  }
+  return 'Invalid columns';
+}
+
+
 
 /**
  * POST /api/orders/export/logistics

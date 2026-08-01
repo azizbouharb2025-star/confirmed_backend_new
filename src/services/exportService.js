@@ -685,3 +685,4 @@ class ExportService {
 }
 
 module.exports = new ExportService();
+module.exports.ExportService = ExportService;
