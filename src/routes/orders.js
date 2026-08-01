@@ -454,8 +454,8 @@ router.get('/import/history', auth, async (req, res, next) => {
  * Export orders in a logistics-provider-specific format.
  * Body: { provider: string, fileType: "csv"|"xlsx", orderIds?: string[] }
  *
- * Supported providers: generic, intigo, aramex, rapid_poste, yalidine
- * Unsupported providers: custom → 422 "not configured yet"
+ * Supported providers: generic, intigo, aramex, rapid_poste, yalidine, custom
+ * Unsupported providers: none remaining
  */
 router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res, next) => {
   try {
@@ -566,7 +566,32 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       return res.send(buf);
     }
 
-    // ── Unsupported providers ───────────────────────────────────────────────
+    // ── Custom export ────────────────────────────────────────────────────────
+    if (normalizedProvider === 'custom') {
+      const ids     = Array.isArray(orderIds) ? orderIds : [];
+      const columns = req.body.columns;
+
+      // Validate columns array
+      const validationError = exportService.constructor.validateCustomColumns(columns);
+      if (validationError) {
+        return res.status(400).json({ error: validationError });
+      }
+
+      if (normalizedFileType === 'csv') {
+        const csv = await exportService.exportCustomCSV(ids, req.user, columns);
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="custom-export.csv"');
+        return res.send(csv);
+      }
+
+      // xlsx
+      const buf = await exportService.exportCustomXLSX(ids, req.user, columns);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', 'attachment; filename="custom-export.xlsx"');
+      return res.send(buf);
+    }
+
+    // ── Unsupported providers (future-proofing) ──────────────────────────────
     return res.status(422).json({
       error: `Provider "${provider}" is not configured yet`
     });

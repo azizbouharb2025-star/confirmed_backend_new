@@ -482,6 +482,172 @@ class ExportService {
       throw error;
     }
   }
+
+  // ─── CUSTOM EXPORT ─────────────────────────────────────────────────────────
+
+  /**
+   * Allowed column keys for custom export.
+   * Maps key → French display label.
+   */
+  static get CUSTOM_COLUMN_LABELS() {
+    return {
+      customerName: 'Nom',
+      phone:        'Téléphone',
+      address:      'Adresse',
+      region:       'Région',
+      city:         'Ville',
+      product:      'Produit',
+      quantity:     'Quantité',
+      amount:       'Montant',
+      aiScore:      'Score IA',
+      riskLevel:    'Niveau de risque',
+      orderDate:    'Date de commande'
+    };
+  }
+
+  /**
+   * Validate the columns array for a custom export request.
+   * Returns null on success, or an error message string on failure.
+   * @param {*} columns
+   * @returns {string|null}
+   */
+  static validateCustomColumns(columns) {
+    if (!Array.isArray(columns)) {
+      return 'columns must be an array';
+    }
+    if (columns.length === 0) {
+      return 'columns must contain at least one column';
+    }
+    const allowed = Object.keys(ExportService.CUSTOM_COLUMN_LABELS);
+    const invalid = columns.filter(c => !allowed.includes(c));
+    if (invalid.length > 0) {
+      return `Invalid column key(s): ${invalid.join(', ')}. Allowed: ${allowed.join(', ')}`;
+    }
+    const seen = new Set();
+    for (const col of columns) {
+      if (seen.has(col)) return `Duplicate column key: ${col}`;
+      seen.add(col);
+    }
+    return null;
+  }
+
+  /**
+   * Format order.createdAt as a readable date string: YYYY-MM-DD HH:MM
+   * @param {Date|string} date
+   * @returns {string}
+   */
+  static formatOrderDate(date) {
+    if (!date) return '';
+    const d = new Date(date);
+    if (isNaN(d.getTime())) return '';
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  /**
+   * Map a single order to a custom row object using the requested columns.
+   * Returns an object keyed by French display label (for CSV/XLSX headers).
+   *
+   * Field mapping:
+   *   customerName → clientInfo.name
+   *   phone        → clientInfo.phone
+   *   address      → buildAddress(clientInfo.address)
+   *   region       → clientInfo.address.state → order.region
+   *   city         → clientInfo.address.city
+   *   product      → formatItems(items)
+   *   quantity     → sum of item.quantity across items[]
+   *   amount       → totalAmount
+   *   aiScore      → order.aiScore (Pro field, may be undefined → '')
+   *   riskLevel    → order.riskLevel (Pro field, may be undefined → '')
+   *   orderDate    → createdAt formatted as YYYY-MM-DD HH:MM
+   *
+   * @param {Object}   order
+   * @param {string[]} columns - ordered list of column keys
+   * @returns {Object} keyed by French label
+   */
+  static mapOrderToCustom(order, columns) {
+    const address   = order.clientInfo?.address || {};
+    const labels    = ExportService.CUSTOM_COLUMN_LABELS;
+    const totalQty  = Array.isArray(order.items)
+      ? order.items.reduce((sum, item) => sum + (item.quantity || 0), 0)
+      : 0;
+
+    const valueMap = {
+      customerName: order.clientInfo?.name                          || '',
+      phone:        order.clientInfo?.phone                         || '',
+      address:      ExportService.buildAddress(address),
+      region:       address.state                                   || order.region || '',
+      city:         address.city                                    || '',
+      product:      ExportService.formatItems(order.items),
+      quantity:     totalQty,
+      amount:       order.totalAmount != null ? order.totalAmount   : '',
+      aiScore:      order.aiScore     != null ? order.aiScore       : '',
+      riskLevel:    order.riskLevel                                 || '',
+      orderDate:    ExportService.formatOrderDate(order.createdAt)
+    };
+
+    // Build result keyed by French label in the requested column order
+    const result = {};
+    for (const col of columns) {
+      result[labels[col]] = valueMap[col];
+    }
+    return result;
+  }
+
+  /**
+   * Export selected orders in Custom format as CSV.
+   * Column order matches the `columns` array exactly.
+   * Headers use French display labels.
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @param {string[]} columns - ordered column keys
+   * @returns {Promise<string>} CSV string (UTF-8 BOM for Excel)
+   */
+  async exportCustomCSV(orderIds, user, columns) {
+    try {
+      const orders  = await this.fetchOrdersForExport(orderIds, user);
+      const labels  = ExportService.CUSTOM_COLUMN_LABELS;
+      const headers = columns.map(col => labels[col]);
+      const rows = orders.map(order => {
+        const row = ExportService.mapOrderToCustom(order, columns);
+        return headers.map(h => escapeCSVField(row[h])).join(',');
+      });
+      return '\uFEFF' + [headers.map(escapeCSVField).join(','), ...rows].join('\n');
+    } catch (error) {
+      logger.error('Error exporting Custom CSV:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Export selected orders in Custom format as XLSX.
+   * Sheet name: Custom
+   * @param {string[]} orderIds
+   * @param {Object}   user
+   * @param {string[]} columns - ordered column keys
+   * @returns {Promise<Buffer>} XLSX buffer
+   */
+  async exportCustomXLSX(orderIds, user, columns) {
+    try {
+      const orders  = await this.fetchOrdersForExport(orderIds, user);
+      const labels  = ExportService.CUSTOM_COLUMN_LABELS;
+      const headers = columns.map(col => labels[col]);
+      const data = [
+        headers,
+        ...orders.map(order => {
+          const row = ExportService.mapOrderToCustom(order, columns);
+          return headers.map(h => row[h]);
+        })
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Custom');
+      return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    } catch (error) {
+      logger.error('Error exporting Custom XLSX:', error);
+      throw error;
+    }
+  }
 }
 
 module.exports = new ExportService();
