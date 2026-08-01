@@ -557,8 +557,8 @@ class ExportService {
    *   product      → formatItems(items)
    *   quantity     → sum of item.quantity across items[]
    *   amount       → totalAmount
-   *   aiScore      → order.aiScore (Pro field, may be undefined → '')
-   *   riskLevel    → order.riskLevel (Pro field, may be undefined → '')
+   *   aiScore      → order.aiScore (Pro field, may be undefined → '—')
+   *   riskLevel    → order.riskLevel (Pro field, may be undefined → 'Non analysé')
    *   orderDate    → createdAt formatted as YYYY-MM-DD HH:MM
    *
    * @param {Object}   order
@@ -581,8 +581,8 @@ class ExportService {
       product:      ExportService.formatItems(order.items),
       quantity:     totalQty,
       amount:       order.totalAmount != null ? order.totalAmount   : '',
-      aiScore:      order.aiScore     != null ? order.aiScore       : '',
-      riskLevel:    order.riskLevel                                 || '',
+      aiScore:      order.aiScore     != null ? order.aiScore       : '\u2014',
+      riskLevel:    order.riskLevel                                 || 'Non analys\u00E9',
       orderDate:    ExportService.formatOrderDate(order.createdAt)
     };
 
