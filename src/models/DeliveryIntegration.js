@@ -8,7 +8,7 @@ const deliveryIntegrationSchema = new mongoose.Schema({
   },
   platform: {
     type: String,
-    enum: ['aramex', 'dhl', 'fedex', 'local_courier', 'custom'],
+    enum: ['aramex', 'intigo', 'dhl', 'fedex', 'local_courier', 'custom'],
     required: true
   },
   credentials: {
@@ -27,6 +27,10 @@ const deliveryIntegrationSchema = new mongoose.Schema({
     trackingEnabled: {
       type: Boolean,
       default: true
+    },
+    pickupIndex: {
+      type: Number,
+      min: 0
     },
     webhookUrl: String
   },

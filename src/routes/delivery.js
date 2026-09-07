@@ -4,6 +4,9 @@ const { auth } = require('../middleware/auth');
 const deliveryService = require('../services/deliveryService');
 const DeliveryIntegration = require('../models/DeliveryIntegration');
 const Order = require('../models/Order');
+const mongoose = require('mongoose');
+const intigoClient = require('../services/delivery/intigoClient');
+const { mapOrderToIntigo } = require('../services/delivery/intigoMapper');
 
 // Helper to verify order belongs to user's shop
 const verifyOrderOwnership = async (orderId, user) => {
@@ -14,6 +17,32 @@ const verifyOrderOwnership = async (orderId, user) => {
     return { valid: false, error: 'Access denied', status: 403 };
   }
   return { valid: true, order };
+};
+
+const serializeIntegration = integration => {
+  const value =
+    integration && typeof integration.toObject === 'function'
+      ? integration.toObject()
+      : integration || {};
+
+  const credentials = value.credentials || {};
+
+  return {
+    _id: value._id,
+    shopId: value.shopId,
+    platform: value.platform,
+    settings: value.settings || {},
+    isActive: value.isActive,
+    credentialsConfigured: Boolean(
+      credentials.apiKey ||
+      credentials.apiSecret ||
+      credentials.username ||
+      credentials.password ||
+      credentials.accountNumber
+    ),
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt
+  };
 };
 
 // Setup delivery integration
@@ -30,7 +59,9 @@ router.post('/integration', auth, async (req, res, next) => {
       credentials,
       settings
     );
-    res.status(201).json(integration);
+    res.status(201).json(
+      serializeIntegration(integration)
+    );
   } catch (error) {
     next(error);
   }
@@ -43,8 +74,202 @@ router.get('/integrations', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'No shop associated with user' });
     }
     
-    const integrations = await DeliveryIntegration.find({ shopId: req.user.shopId });
-    res.json(integrations);
+    const integrations = await DeliveryIntegration.find({
+      shopId: req.user.shopId
+    });
+
+    res.json(
+      integrations.map(serializeIntegration)
+    );
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/delivery/intigo/preview
+ *
+ * Pré-valide les commandes sélectionnées avant tout envoi vers Intigo.
+ * Aucun colis n'est créé par cette route.
+ *
+ * Body:
+ * {
+ *   "orderIds": ["<mongodb-id>", "..."]
+ * }
+ */
+router.post('/intigo/preview', auth, async (req, res, next) => {
+  try {
+    if (!req.user.shopId) {
+      return res.status(400).json({
+        error: 'No shop associated with user'
+      });
+    }
+
+    const { orderIds } = req.body;
+
+    if (
+      !Array.isArray(orderIds) ||
+      orderIds.length === 0
+    ) {
+      return res.status(400).json({
+        error: 'orderIds must contain at least one order'
+      });
+    }
+
+    if (orderIds.length > 100) {
+      return res.status(400).json({
+        error: 'Maximum 100 orders per Intigo preview'
+      });
+    }
+
+    const normalizedIds = [
+      ...new Set(
+        orderIds.map(id => String(id).trim())
+      )
+    ];
+
+    const malformedIds = normalizedIds.filter(
+      id => !mongoose.Types.ObjectId.isValid(id)
+    );
+
+    if (malformedIds.length > 0) {
+      return res.status(400).json({
+        error: 'Invalid MongoDB order IDs',
+        invalidOrderIds: malformedIds
+      });
+    }
+
+    const orders = await Order.find({
+      _id: {
+        $in: normalizedIds
+      },
+      shopId: req.user.shopId
+    }).lean();
+
+    const orderById = new Map(
+      orders.map(order => [
+        String(order._id),
+        order
+      ])
+    );
+
+    const ready = [];
+    const review = [];
+    const invalid = [];
+
+    for (const requestedId of normalizedIds) {
+      const order = orderById.get(requestedId);
+
+      if (!order) {
+        invalid.push({
+          orderId: requestedId,
+          confirmedId: null,
+          errors: [
+            'Commande introuvable ou hors de cette boutique'
+          ]
+        });
+
+        continue;
+      }
+
+      const {
+        payload,
+        errors
+      } = mapOrderToIntigo(order);
+
+      if (errors.length > 0) {
+        invalid.push({
+          orderId: requestedId,
+          confirmedId: order.confirmedId,
+          errors
+        });
+
+        continue;
+      }
+
+      const location =
+        await intigoClient.resolveLocation(
+          payload.city_name,
+          payload.district_name
+        );
+
+      if (!location.valid) {
+        invalid.push({
+          orderId: requestedId,
+          confirmedId: order.confirmedId,
+          errors: [location.error]
+        });
+
+        continue;
+      }
+
+      const previewItem = {
+        orderId: requestedId,
+        confirmedId: order.confirmedId,
+        cid: payload.cid,
+        city_name: location.city.name,
+        district_name:
+          location.district?.name ||
+          payload.district_name ||
+          null,
+        districtResolved: Boolean(location.district),
+        price: payload.price,
+        itemCount: Array.isArray(order.items)
+          ? order.items.length
+          : 0,
+        warnings: location.warning
+          ? [location.warning]
+          : []
+      };
+
+      if (location.warning) {
+        review.push(previewItem);
+        continue;
+      }
+
+      ready.push(previewItem);
+    }
+
+    const integration =
+      await DeliveryIntegration.findOne({
+        shopId: req.user.shopId,
+        platform: 'intigo',
+        isActive: true
+      }).lean();
+
+    const pickupIndex =
+      integration?.settings?.pickupIndex;
+
+    const integrationReady = Boolean(
+      integration &&
+      integration.credentials?.apiKey &&
+      Number.isInteger(pickupIndex)
+    );
+
+    return res.json({
+      success: true,
+      provider: 'intigo',
+
+      integration: {
+        configured: Boolean(integration),
+        ready: integrationReady,
+        pickupIndex:
+          Number.isInteger(pickupIndex)
+            ? pickupIndex
+            : null
+      },
+
+      summary: {
+        selected: normalizedIds.length,
+        ready: ready.length,
+        review: review.length,
+        invalid: invalid.length
+      },
+
+      ready,
+      review,
+      invalid
+    });
   } catch (error) {
     next(error);
   }
