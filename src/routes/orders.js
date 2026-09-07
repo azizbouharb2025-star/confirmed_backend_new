@@ -2,6 +2,7 @@ const express = require('express');
 const Joi = require('joi');
 const multer = require('multer');
 const Order = require('../models/Order');
+require('../models/Product');
 const ImportHistory = require('../models/ImportHistory');
 const ExportTemplate = require('../models/ExportTemplate');
 const { auth, authorize } = require('../middleware/auth');
@@ -36,15 +37,19 @@ const upload = multer({
 const router = express.Router();
 
 const createOrderSchema = Joi.object({
-  orderId: Joi.string().required(),
+  orderId: Joi.string().allow('').optional(),
   clientInfo: Joi.object({
     name: Joi.string().required(),
     phone: Joi.string().required(),
+    additionalPhones: Joi.array().items(
+      Joi.string().trim()
+    ),
     email: Joi.string().email(),
     address: Joi.object({
       street: Joi.string(),
       city: Joi.string(),
       state: Joi.string(),
+      district: Joi.string(),
       zipCode: Joi.string(),
       country: Joi.string()
     })
@@ -55,17 +60,255 @@ const createOrderSchema = Joi.object({
     price: Joi.number(),
     sku: Joi.string()
   })),
+  deliveryFee: Joi.number().min(0),
   totalAmount: Joi.number().required(),
   deliveryInfo: Joi.object({
     estimatedDate: Joi.date(),
     trackingNumber: Joi.string(),
-    carrier: Joi.string()
+    carrier: Joi.string(),
+    secondaryPhone: Joi.string(),
+    packageCount: Joi.number().integer().min(1),
+    comment: Joi.string(),
+    weight: Joi.number().min(0),
+    colissimoType: Joi.string().valid(
+      'VO', 'VM', 'GV', 'EXP',
+      'FIX', 'ONP', 'BLK', 'SMD'
+    )
   })
+});
+
+
+/**
+ * Données que l'opérateur peut corriger directement
+ * depuis son espace de travail.
+ *
+ * Le totalAmount n'est volontairement PAS accepté :
+ * il est recalculé côté serveur.
+ */
+const operatorDetailsSchema = Joi.object({
+  clientInfo: Joi.object({
+    name: Joi.string().trim().min(1),
+    phone: Joi.string().trim().min(1),
+
+    additionalPhones: Joi.array()
+      .items(Joi.string().trim().min(1))
+      .max(10),
+
+    address: Joi.object({
+      street: Joi.string().allow('').trim(),
+      city: Joi.string().allow('').trim(),
+
+      // state = gouvernorat dans le modèle actuel
+      state: Joi.string().allow('').trim(),
+
+      district: Joi.string().allow('').trim(),
+      zipCode: Joi.string().allow('').trim(),
+      country: Joi.string().allow('').trim()
+    }).min(1)
+  }).min(1),
+
+  items: Joi.array()
+    .items(
+      Joi.object({
+        _id: Joi.string().required(),
+
+        // Permet à l'opérateur de changer le produit
+        // lorsqu'un produit catalogue est disponible.
+        productId: Joi.string().allow('', null),
+
+        // Utile pour les anciennes commandes/imports
+        // qui ne sont pas reliées au catalogue.
+        name: Joi.string().trim().min(1),
+
+        quantity: Joi.number()
+          .integer()
+          .min(1),
+
+        price: Joi.number()
+          .min(0)
+      }).or('productId', 'name', 'quantity', 'price')
+    )
+    .min(1),
+
+  deliveryFee: Joi.number()
+    .min(0)
+}).min(1);
+
+
+const operatorConfirmationSchema = Joi.object({
+  toneSignals: Joi.array()
+    .items(
+      Joi.string().valid(
+        'polite',
+        'confident',
+        'enthusiastic',
+        'quick_response',
+        'hesitant',
+        'distracted',
+        'long_pauses',
+        'rude',
+        'aggressive',
+        'nervous',
+        'low_interest'
+      )
+    )
+    .min(1)
+    .max(3)
+    .unique()
+    .required(),
+
+  confirmationLevel: Joi.string()
+    .valid(
+      'very_firm',
+      'normal',
+      'weak'
+    )
+    .required(),
+
+  priceBehavior: Joi.string()
+    .valid(
+      'no_issue',
+      'asks_discount',
+      'insists_discount',
+      'strong_negotiation'
+    )
+    .required(),
+
+  productDoubts: Joi.string()
+    .valid(
+      'none',
+      'asks_question',
+      'multiple_doubts',
+      'compares_seller'
+    )
+    .required(),
+
+  deliveryInformation: Joi.string()
+    .valid(
+      'complete_quick',
+      'clear_precise',
+      'partial',
+      'vague',
+      'difficulty',
+      'refuses_details'
+    )
+    .required(),
+
+  engagementLevel: Joi.string()
+    .valid(
+      'very_engaged',
+      'interested',
+      'passive',
+      'low_involvement',
+      'distracted'
+    )
+    .required(),
+
+  receptionIntent: Joi.string()
+    .valid(
+      'wants_fast_delivery',
+      'clearly_confirms_receipt',
+      'asks_delivery_info',
+      'uncertain_receipt',
+      'does_not_know_when'
+    )
+    .required(),
+
+  notes: Joi.string()
+    .allow('')
+    .max(1500)
+    .optional(),
+
+  // Durée réelle de l'appel en secondes.
+  duration: Joi.number()
+    .integer()
+    .min(1)
+    .max(21600)
+    .optional()
+
+});
+
+const operatorPostponeSchema = Joi.object({
+  date: Joi.string()
+    .pattern(/^\d{4}-\d{2}-\d{2}$/)
+    .required(),
+
+  time: Joi.string()
+    .pattern(/^([01]\d|2[0-3]):[0-5]\d$/)
+    .allow('', null)
+    .optional(),
+
+  note: Joi.string()
+    .allow('')
+    .max(1000)
+    .optional(),
+
+  /*
+   * JavaScript Date#getTimezoneOffset().
+   * Exemple UTC+1 : -60.
+   */
+  timezoneOffsetMinutes: Joi.number()
+    .integer()
+    .min(-840)
+    .max(840)
+    .required()
+});
+
+
+const operatorCancellationSchema = Joi.object({
+  reason: Joi.string()
+    .valid(
+      'customer_refused',
+      'price_too_high',
+      'quality_doubts',
+      'duplicate_order',
+      'fake_number',
+      'not_available',
+      'courier_failed',
+      'customer_rejected_at_door'
+    )
+    .allow(null, '')
+    .optional(),
+
+  comment: Joi.string()
+    .allow('')
+    .max(1000)
+    .optional()
+});
+
+
+const callAttemptSchema = Joi.object({
+  attemptNumber: Joi.number()
+    .integer()
+    .valid(1, 2, 3)
+    .required(),
+
+  reason: Joi.string()
+    .valid(
+      'no_answer',
+      'busy',
+      'unreachable',
+      'callback_requested',
+      'interrupted',
+      'other'
+    )
+    .allow(null, '')
+    .optional(),
+
+  notes: Joi.string()
+    .allow('')
+    .max(1000)
+    .optional(),
+
+  duration: Joi.number()
+    .integer()
+    .min(0)
+    .optional()
 });
 
 const bulkStatusSchema = Joi.object({
   orderIds: Joi.array().items(Joi.string()).min(1).required(),
-  status: Joi.string().valid('pending', 'confirmed', 'called', 'delivered', 'cancelled').required()
+  status: Joi.string().valid('pending', 'assigned', 'in_progress', 'confirmed', 'rejected', 'cancelled', 'postponed', 'shipped', 'delivered', 'failed_delivery').required()
 });
 
 /**
@@ -79,8 +322,17 @@ router.post('/', auth, authorize('shop_owner'), async (req, res, next) => {
     const { error } = createOrderSchema.validate(req.body);
     if (error) return res.status(400).json({ error: error.details[0].message });
 
+    // L'identifiant principal est généré exclusivement par CONFIRMED.
+    // Toute valeur orderId/confirmedId envoyée par le formulaire manuel est ignorée.
+    const {
+      orderId: _ignoredOrderId,
+      confirmedId: _ignoredConfirmedId,
+      externalOrderId: _ignoredExternalOrderId,
+      ...manualOrderData
+    } = req.body;
+
     const order = await orderService.createOrder({
-      ...req.body,
+      ...manualOrderData,
       shopId: req.user.shopId
     });
 
@@ -107,26 +359,51 @@ router.post('/', auth, authorize('shop_owner'), async (req, res, next) => {
  */
 router.get('/recent', auth, async (req, res, next) => {
   try {
-    const { limit = 10 } = req.query;
-    const shopId = req.user.role === 'shop_owner' ? req.user.shopId : null;
-    
+    const requestedLimit = parseInt(req.query.limit, 10);
+
+    const limit =
+      Number.isFinite(requestedLimit) && requestedLimit > 0
+        ? Math.min(requestedLimit, 20)
+        : 5;
+
+    const shopId =
+      req.user.role === 'shop_owner'
+        ? req.user.shopId
+        : null;
+
     const query = shopId ? { shopId } : {};
-    
+
     const orders = await Order.find(query)
       .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .select('orderId clientInfo.name totalAmount status createdAt items')
+      .limit(limit)
+      .select(
+        'confirmedId orderId externalOrderId clientInfo.name clientInfo.phone items totalAmount status aiScore createdAt'
+      )
+      .populate('items.productId', 'name imageUrl')
       .lean();
-    
-    res.json(orders.map(order => ({
-      id: order._id,
-      orderId: order.orderId,
-      customerName: order.clientInfo?.name || 'Unknown',
-      amount: order.totalAmount,
-      status: order.status,
-      createdAt: order.createdAt,
-      itemCount: order.items?.length || 0
-    })));
+
+    res.json(
+      orders.map(order => ({
+        _id: order._id,
+        confirmedId: order.confirmedId,
+        orderId: order.orderId,
+        externalOrderId: order.externalOrderId,
+
+        clientInfo: {
+          name: order.clientInfo?.name || 'Client inconnu',
+          phone: order.clientInfo?.phone || ''
+        },
+
+        items: order.items || [],
+        totalAmount: order.totalAmount || 0,
+        status: order.status,
+        aiScore:
+          typeof order.aiScore === 'number'
+            ? order.aiScore
+            : null,
+        createdAt: order.createdAt
+      }))
+    );
   } catch (error) {
     next(error);
   }
@@ -172,6 +449,338 @@ router.get('/:id', auth, async (req, res, next) => {
   }
 });
 
+
+
+/**
+ * POST /api/orders/:id/operator-actions/confirm
+ *
+ * Confirmation finale après saisie du Retour opérateur.
+ */
+router.post(
+  '/:id/operator-actions/confirm',
+  auth,
+  authorize('operator'),
+  async (req, res, next) => {
+    try {
+      const { error, value } =
+        operatorConfirmationSchema.validate(
+          req.body || {},
+          {
+            abortEarly: false,
+            stripUnknown: true
+          }
+        );
+
+      if (error) {
+        return res.status(400).json({
+          error:
+            'Le retour opérateur est incomplet ou invalide.',
+          details: error.details.map(
+            detail => detail.message
+          )
+        });
+      }
+
+      const order =
+        await orderService.confirmByOperator(
+          req.params.id,
+          value,
+          req.user
+        );
+
+      res.json(order);
+    } catch (error) {
+      if (
+        error.statusCode === 400 ||
+        error.statusCode === 403 ||
+        error.statusCode === 404 ||
+        error.statusCode === 409 ||
+        error.statusCode === 422
+      ) {
+        return res.status(error.statusCode).json({
+          error: error.message
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * POST /api/orders/:id/operator-actions/postpone
+ *
+ * Reporter une commande.
+ *
+ * - date obligatoire
+ * - heure facultative
+ * - note facultative
+ */
+router.post(
+  '/:id/operator-actions/postpone',
+  auth,
+  authorize('operator'),
+  async (req, res, next) => {
+    try {
+      const { error, value } =
+        operatorPostponeSchema.validate(
+          req.body || {},
+          {
+            abortEarly: false,
+            stripUnknown: true
+          }
+        );
+
+      if (error) {
+        return res.status(400).json({
+          error: 'Données de report invalides.',
+          details: error.details.map(
+            detail => detail.message
+          )
+        });
+      }
+
+      const order =
+        await orderService.postponeByOperator(
+          req.params.id,
+          value,
+          req.user
+        );
+
+      res.json(order);
+    } catch (error) {
+      if (
+        error.statusCode === 400 ||
+        error.statusCode === 403 ||
+        error.statusCode === 404 ||
+        error.statusCode === 409 ||
+        error.statusCode === 422
+      ) {
+        return res.status(error.statusCode).json({
+          error: error.message
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * POST /api/orders/:id/operator-actions/cancel
+ *
+ * Annulation manuelle par un opérateur.
+ *
+ * - motif facultatif
+ * - commentaire facultatif
+ * - statut final : cancelled
+ */
+router.post(
+  '/:id/operator-actions/cancel',
+  auth,
+  authorize('operator'),
+  async (req, res, next) => {
+    try {
+      const { error, value } =
+        operatorCancellationSchema.validate(
+          req.body || {},
+          {
+            abortEarly: false,
+            stripUnknown: true
+          }
+        );
+
+      if (error) {
+        return res.status(400).json({
+          error: 'Données d’annulation invalides.',
+          details: error.details.map(
+            detail => detail.message
+          )
+        });
+      }
+
+      const order =
+        await orderService.cancelByOperator(
+          req.params.id,
+          value,
+          req.user
+        );
+
+      res.json(order);
+    } catch (error) {
+      if (
+        error.statusCode === 403 ||
+        error.statusCode === 404 ||
+        error.statusCode === 409
+      ) {
+        return res.status(error.statusCode).json({
+          error: error.message
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * POST /api/orders/:id/call-attempt
+ *
+ * Enregistre une tentative de contact.
+ *
+ * T1 / T2 :
+ * - la commande reste dans la File d'attente
+ *
+ * T3 :
+ * - la commande n'est PAS annulée immédiatement
+ * - l'API indique au frontend qu'une confirmation
+ *   d'annulation doit être demandée
+ */
+router.post(
+  '/:id/call-attempt',
+  auth,
+  authorize('operator'),
+  async (req, res, next) => {
+    try {
+      const { error, value } =
+        callAttemptSchema.validate(req.body, {
+          abortEarly: false,
+          stripUnknown: true
+        });
+
+      if (error) {
+        return res.status(400).json({
+          error: 'Données de tentative invalides.',
+          details: error.details.map(
+            detail => detail.message
+          )
+        });
+      }
+
+      const result =
+        await orderService.recordCallAttempt(
+          req.params.id,
+          value,
+          req.user
+        );
+
+      res.json(result);
+    } catch (error) {
+      if (
+        error.statusCode === 403 ||
+        error.statusCode === 404 ||
+        error.statusCode === 409 ||
+        error.statusCode === 422
+      ) {
+        return res.status(error.statusCode).json({
+          error: error.message
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/orders/:id/call-attempt/confirm-cancellation
+ *
+ * Confirmation finale demandée après la Tentative 3.
+ *
+ * Aucune annulation automatique ne se produit avant
+ * cet appel explicite du frontend.
+ */
+router.post(
+  '/:id/call-attempt/confirm-cancellation',
+  auth,
+  authorize('operator'),
+  async (req, res, next) => {
+    try {
+      const order =
+        await orderService.confirmUnreachableCancellation(
+          req.params.id,
+          req.user
+        );
+
+      res.json(order);
+    } catch (error) {
+      if (
+        error.statusCode === 403 ||
+        error.statusCode === 404 ||
+        error.statusCode === 409
+      ) {
+        return res.status(error.statusCode).json({
+          error: error.message
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * PATCH /api/orders/:id/operator-details
+ *
+ * Modification des informations opérationnelles
+ * pendant l'appel.
+ *
+ * Rôles :
+ * - operator
+ * - admin
+ *
+ * Le montant total est recalculé côté serveur.
+ */
+router.patch(
+  '/:id/operator-details',
+  auth,
+  authorize('operator', 'admin'),
+  async (req, res, next) => {
+    try {
+      const { error, value } = operatorDetailsSchema.validate(
+        req.body,
+        {
+          abortEarly: false,
+          stripUnknown: true
+        }
+      );
+
+      if (error) {
+        return res.status(400).json({
+          error: 'Données de commande invalides.',
+          details: error.details.map(detail => detail.message)
+        });
+      }
+
+      const order = await orderService.updateOperatorDetails(
+        req.params.id,
+        value,
+        req.user
+      );
+
+      res.json(order);
+    } catch (error) {
+      if (
+        error.statusCode === 400 ||
+        error.statusCode === 403 ||
+        error.statusCode === 404 ||
+        error.statusCode === 409 ||
+        error.statusCode === 422
+      ) {
+        return res.status(error.statusCode).json({
+          error: error.message
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
 /**
  * PATCH /api/orders/:id/status
  * Update order status and add call history entry
@@ -185,7 +794,7 @@ router.patch('/:id/status', auth, async (req, res, next) => {
       return res.status(400).json({ error: 'Status is required' });
     }
     
-    const validStatuses = ['pending', 'confirmed', 'called', 'delivered', 'cancelled'];
+    const validStatuses = ['pending', 'assigned', 'in_progress', 'confirmed', 'rejected', 'cancelled', 'postponed', 'shipped', 'delivered', 'failed_delivery'];
     if (!validStatuses.includes(status)) {
       return res.status(422).json({ error: 'Invalid status value' });
     }
@@ -688,6 +1297,37 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
     const normalizedProvider = String(provider).toLowerCase().trim();
     const normalizedFileType = String(fileType).toLowerCase().trim();
 
+    const logLogisticsExport = async () => {
+      const { logActivity } = require('../services/activityLogService');
+
+      const providerNames = {
+        generic: 'Générique',
+        intigo: 'Intigo',
+        colissimo: 'Colissimo',
+        aramex: 'Aramex',
+        rapid_poste: 'Rapid Poste',
+        yalidine: 'Yalidine',
+        custom: 'Export personnalisé'
+      };
+
+      const providerLabel =
+        providerNames[normalizedProvider] ||
+        normalizedProvider;
+
+      const selectedCount =
+        Array.isArray(orderIds)
+          ? orderIds.length
+          : null;
+
+      await logActivity(
+        'export',
+        'Export effectué',
+        selectedCount !== null
+          ? `${selectedCount} commande(s) exportée(s) vers ${providerLabel}`
+          : `Export de commandes effectué vers ${providerLabel}`
+      );
+    };
+
     if (!['csv', 'xlsx'].includes(normalizedFileType)) {
       return res.status(400).json({ error: 'fileType must be "csv" or "xlsx"' });
     }
@@ -701,6 +1341,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       if (normalizedFileType === 'csv') {
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        await logLogisticsExport();
         return res.send(csv);
       }
       // XLSX for generic: convert CSV to XLSX via SheetJS
@@ -715,6 +1356,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      await logLogisticsExport();
       return res.send(buf);
     }
 
@@ -726,6 +1368,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportIntigoCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="intigo-export.csv"');
+        await logLogisticsExport();
         return res.send(csv);
       }
 
@@ -733,6 +1376,32 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportIntigoXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="intigo-export.xlsx"');
+      await logLogisticsExport();
+      return res.send(buf);
+    }
+
+    // ── Colissimo export ─────────────────────────────────────────────────────
+    if (normalizedProvider === 'colissimo') {
+      const ids = Array.isArray(orderIds) ? orderIds : [];
+
+      if (normalizedFileType === 'csv') {
+        const csv = await exportService.exportColissimoCSV(ids, req.user);
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="colissimo-export.csv"');
+        await logLogisticsExport();
+        return res.send(csv);
+      }
+
+      const buf = await exportService.exportColissimoXLSX(ids, req.user);
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="colissimo-export.xlsx"'
+      );
+      await logLogisticsExport();
       return res.send(buf);
     }
 
@@ -744,6 +1413,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportAramexCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="aramex-export.csv"');
+        await logLogisticsExport();
         return res.send(csv);
       }
 
@@ -751,6 +1421,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportAramexXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="aramex-export.xlsx"');
+      await logLogisticsExport();
       return res.send(buf);
     }
 
@@ -762,6 +1433,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportRapidPosteCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="rapid-poste-export.csv"');
+        await logLogisticsExport();
         return res.send(csv);
       }
 
@@ -769,6 +1441,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportRapidPosteXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="rapid-poste-export.xlsx"');
+      await logLogisticsExport();
       return res.send(buf);
     }
 
@@ -780,6 +1453,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportYalidineCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="yalidine-export.csv"');
+        await logLogisticsExport();
         return res.send(csv);
       }
 
@@ -787,6 +1461,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportYalidineXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="yalidine-export.xlsx"');
+      await logLogisticsExport();
       return res.send(buf);
     }
 
@@ -805,6 +1480,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportCustomCSV(ids, req.user, columns);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="custom-export.csv"');
+        await logLogisticsExport();
         return res.send(csv);
       }
 
@@ -812,6 +1488,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportCustomXLSX(ids, req.user, columns);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="custom-export.xlsx"');
+      await logLogisticsExport();
       return res.send(buf);
     }
 
@@ -905,6 +1582,14 @@ router.post('/export-delivery', auth, authorize('shop_owner'), async (req, res, 
     const csv = generateDeliveryCSV(orders, courierName);
     const dateStr = new Date().toISOString().split('T')[0];
     const filename = `export-livraison-${courierName.toLowerCase()}-${dateStr}.csv`;
+
+    const { logActivity } = require('../services/activityLogService');
+
+    await logActivity(
+      'export',
+      'Export effectué',
+      `${orders.length} commande(s) exportée(s) vers ${courierName}`
+    );
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);

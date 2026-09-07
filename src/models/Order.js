@@ -1,9 +1,25 @@
 const mongoose = require('mongoose');
+const Counter = require('./Counter');
 
 const orderSchema = new mongoose.Schema({
-  orderId: {
+  // Identifiant global interne CONFIRMED.
+  // Affiché dans l'interface sous la forme #1, #2, #3...
+  confirmedId: {
+    type: Number,
+    min: 1,
+    immutable: true
+  },
+
+  // Référence originale provenant de la boutique, du CMS ou du fichier importé.
+  externalOrderId: {
     type: String,
-    required: true
+    trim: true
+  },
+
+  // Champ historique conservé temporairement pour compatibilité avec
+  // les intégrations, exports et services existants.
+  orderId: {
+    type: String
   },
   shopId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -19,11 +35,20 @@ const orderSchema = new mongoose.Schema({
       type: String,
       required: true
     },
+
+    // Numéros supplémentaires fournis/corrigés pendant l'appel opérateur.
+    // Le téléphone principal reste clientInfo.phone.
+    additionalPhones: [{
+      type: String,
+      trim: true
+    }],
+
     email: String,
     address: {
       street: String,
       city: String,
       state: String,
+      district: String,
       zipCode: String,
       country: String
     }
@@ -39,24 +64,76 @@ const orderSchema = new mongoose.Schema({
     sku: String,
     url: String
   }],
+
+  // Frais appliqués à cette commande.
+  // Ils sont indépendants du deliveryFee par défaut du catalogue produit.
+  deliveryFee: {
+    type: Number,
+    min: 0,
+    default: 0
+  },
+
   totalAmount: {
     type: Number,
     required: true
   },
   status: {
     type: String,
-    enum: ['pending', 'assigned', 'in_progress', 'confirmed', 'rejected', 'cancelled', 'shipped', 'delivered', 'failed_delivery'],
+    enum: ['pending', 'assigned', 'in_progress', 'confirmed', 'rejected', 'cancelled', 'postponed', 'shipped', 'delivered', 'failed_delivery'],
     default: 'pending'
   },
   deliveryInfo: {
     estimatedDate: Date,
     trackingNumber: String,
-    carrier: String
+    carrier: String,
+    secondaryPhone: String,
+    packageCount: Number,
+    comment: String,
+    weight: Number,
+    colissimoType: {
+      type: String,
+      enum: ['VO', 'VM', 'GV', 'EXP', 'FIX', 'ONP', 'BLK', 'SMD']
+    }
   },
   assignedOperatorId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
+
+  /*
+   * Informations de report / rappel opérateur.
+   *
+   * date et time conservent la saisie utilisateur.
+   * scheduledFor est la date UTC utilisée par la File
+   * d'attente pour réinsérer automatiquement la commande.
+   */
+  postponement: {
+    date: {
+      type: String,
+      trim: true
+    },
+    time: {
+      type: String,
+      trim: true,
+      default: ''
+    },
+    scheduledFor: {
+      type: Date
+    },
+    note: {
+      type: String,
+      trim: true,
+      default: ''
+    },
+    postponedAt: {
+      type: Date
+    },
+    postponedByOperatorId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }
+  },
+
   callHistory: [{
     operatorId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -71,11 +148,51 @@ const orderSchema = new mongoose.Schema({
       default: Date.now
     },
     duration: Number,
+
+    // Numéro de tentative de contact opérateur.
+    // 1, 2 ou 3 uniquement pour les tentatives infructueuses.
+    attemptNumber: {
+      type: Number,
+      min: 1,
+      max: 3
+    },
+
     result: {
       type: String,
-      enum: ['confirmed', 'rejected', 'no_answer', 'busy']
+      enum: [
+        'confirmed',
+        'rejected',
+        'no_answer',
+        'busy',
+        'unreachable',
+        'callback_requested',
+        'interrupted',
+        'other'
+      ]
     },
-    notes: String
+
+    // Motif structuré de la tentative.
+    attemptReason: {
+      type: String,
+      enum: [
+        'no_answer',
+        'busy',
+        'unreachable',
+        'callback_requested',
+        'interrupted',
+        'other'
+      ]
+    },
+
+    notes: String,
+
+    /*
+     * Snapshot du retour opérateur au moment de l'appel.
+     * La version structurée principale reste operatorFeedback.
+     */
+    feedback: {
+      type: mongoose.Schema.Types.Mixed
+    }
   }],
   priority: {
     type: String,
@@ -97,8 +214,31 @@ const orderSchema = new mongoose.Schema({
   },
   riskLevel: {
     type: String,
-    enum: ['high', 'medium', 'low'],
+    enum: ['critical', 'high', 'medium', 'low', 'very_low'],
     description: "Risk level based on AI score"
+  },
+
+  aiScoredAt: {
+    type: Date,
+    description: "Date and time when the AI score was calculated"
+  },
+
+  aiDecision: {
+    type: String,
+    enum: ['accept', 'review', 'reject'],
+    description: "Decision derived from the AI score"
+  },
+
+  aiScoreDetails: {
+    baseScore: Number,
+    finalScore: Number,
+    factors: [{
+      key: String,
+      label: String,
+      value: mongoose.Schema.Types.Mixed,
+      impact: Number,
+      applied: Boolean
+    }]
   },
   deliverySuccessProbability: {
     type: Number,
@@ -106,16 +246,120 @@ const orderSchema = new mongoose.Schema({
     max: 100,
     description: "Probability of successful delivery"
   },
+  /*
+   * Retour comportemental structuré de l'opérateur.
+   *
+   * confidence est conservé uniquement pour compatibilité
+   * avec les anciennes analyses déjà présentes.
+   */
   operatorFeedback: {
     confidence: {
       type: String,
       enum: ['strong', 'doubtful', 'neutral']
     },
-    notes: String,
+
+    toneSignals: [{
+      type: String,
+      enum: [
+        'polite',
+        'confident',
+        'enthusiastic',
+        'quick_response',
+        'hesitant',
+        'distracted',
+        'long_pauses',
+        'rude',
+        'aggressive',
+        'nervous',
+        'low_interest'
+      ]
+    }],
+
+    confirmationLevel: {
+      type: String,
+      enum: [
+        'very_firm',
+        'normal',
+        'weak'
+      ]
+    },
+
+    priceBehavior: {
+      type: String,
+      enum: [
+        'no_issue',
+        'asks_discount',
+        'insists_discount',
+        'strong_negotiation'
+      ]
+    },
+
+    productDoubts: {
+      type: String,
+      enum: [
+        'none',
+        'asks_question',
+        'multiple_doubts',
+        'compares_seller'
+      ]
+    },
+
+    deliveryInformation: {
+      type: String,
+      enum: [
+        'complete_quick',
+        'clear_precise',
+        'partial',
+        'vague',
+        'difficulty',
+        'refuses_details'
+      ]
+    },
+
+    engagementLevel: {
+      type: String,
+      enum: [
+        'very_engaged',
+        'interested',
+        'passive',
+        'low_involvement',
+        'distracted'
+      ]
+    },
+
+    receptionIntent: {
+      type: String,
+      enum: [
+        'wants_fast_delivery',
+        'clearly_confirms_receipt',
+        'asks_delivery_info',
+        'uncertain_receipt',
+        'does_not_know_when'
+      ]
+    },
+
+    notes: {
+      type: String,
+      default: ''
+    },
+
     operatorId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User'
+    },
+
+    submittedAt: {
+      type: Date
     }
+  },
+
+  confirmedAt: {
+    type: Date
+  },
+
+  confirmedByOperatorId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
   },
 
   // Business tier fields
@@ -151,7 +395,8 @@ const orderSchema = new mongoose.Schema({
       'fake_number',
       'not_available',
       'courier_failed',
-      'customer_rejected_at_door'
+      'customer_rejected_at_door',
+      'unreachable_after_3_attempts'
     ],
     description: "Reason for order cancellation"
   },
@@ -164,6 +409,49 @@ const orderSchema = new mongoose.Schema({
     enum: ['customer', 'operator', 'system', 'courier'],
     description: "Who cancelled the order"
   },
+
+  cancelledAt: {
+    type: Date
+  },
+
+  cancelledByOperatorId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+
+  // Historique des changements importants de statut.
+  statusHistory: [{
+    status: {
+      type: String,
+      enum: [
+        'pending',
+        'assigned',
+        'in_progress',
+        'confirmed',
+        'rejected',
+        'cancelled',
+        'postponed',
+        'shipped',
+        'delivered',
+        'failed_delivery'
+      ]
+    },
+    timestamp: {
+      type: Date,
+      default: Date.now
+    },
+    operatorId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    source: {
+      type: String,
+      enum: ['operator', 'system', 'customer', 'courier']
+    },
+    reason: String,
+    notes: String
+  }],
+
   deliveryAttempts: [{
     attemptNumber: Number,
     attemptDate: Date,
@@ -186,6 +474,50 @@ const orderSchema = new mongoose.Schema({
 }, {
   timestamps: true
 });
+
+// Attribution atomique de l'identifiant global CONFIRMED.
+// Le compteur MongoDB garantit qu'une seule commande peut recevoir
+// un numéro donné, même avec plusieurs instances PM2 ou créations simultanées.
+orderSchema.pre('save', async function () {
+  if (!this.isNew) {
+    return;
+  }
+
+  if (!this.confirmedId) {
+    const counter = await Counter.findOneAndUpdate(
+      { _id: 'order' },
+      { $inc: { seq: 1 } },
+      {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true
+      }
+    );
+
+    this.confirmedId = counter.seq;
+  }
+
+  // Si un ancien orderId est fourni par Shopify/CMS/import,
+  // on le conserve également comme référence externe.
+  if (!this.externalOrderId && this.orderId) {
+    this.externalOrderId = String(this.orderId);
+  }
+
+  // Compatibilité temporaire pour les créations sans référence externe.
+  // Ce champ pourra être retiré lorsque tout le code utilisera confirmedId.
+  if (!this.orderId) {
+    this.orderId = `CONF-${this.confirmedId}`;
+  }
+});
+
+orderSchema.index(
+  { confirmedId: 1 },
+  {
+    unique: true,
+    sparse: true,
+    name: 'confirmed_id_unique'
+  }
+);
 
 orderSchema.index({ shopId: 1, status: 1 });
 orderSchema.index({ assignedOperatorId: 1 });

@@ -47,6 +47,28 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: true
   },
+
+  // Statut fonctionnel du compte pour l'administration.
+  // isActive reste conservé pour compatibilité avec l'auth existante.
+  accountStatus: {
+    type: String,
+    enum: ['pending', 'active', 'disabled'],
+    default: 'active'
+  },
+
+  // Dernière authentification réussie.
+  lastLogin: {
+    type: Date,
+    default: null
+  },
+
+  // Dernière activité réelle sur l'interface opérateur.
+  // Utilisée par l'Admin pour distinguer disponible / hors ligne.
+  lastActiveAt: {
+    type: Date,
+    default: null
+  },
+
   shopId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Shop'

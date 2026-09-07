@@ -6,8 +6,93 @@ const User = require('../models/User');
 const Mission = require('../models/Mission');
 const OperatorWallet = require('../models/OperatorWallet');
 const RewardTransaction = require('../models/RewardTransaction');
+const { logActivity } = require('../services/activityLogService');
 
 const router = express.Router();
+
+/*
+ * Présence opérateur.
+ *
+ * Toute utilisation réelle d'une route /api/operators
+ * actualise lastActiveAt.
+ *
+ * Après plus de 5 minutes sans activité, l'Admin le verra
+ * automatiquement comme "Hors ligne".
+ */
+router.use(auth, async (req, res, next) => {
+  try {
+    if (req.user?.role === 'operator') {
+      const now = new Date();
+
+      const previousActivity =
+        req.user.lastActiveAt
+          ? new Date(req.user.lastActiveAt)
+          : null;
+
+      const wasOffline =
+        !previousActivity ||
+        now.getTime() - previousActivity.getTime() >
+          5 * 60 * 1000;
+
+      await User.findByIdAndUpdate(
+        req.user._id,
+        {
+          $set: {
+            lastActiveAt: now
+          }
+        }
+      );
+
+      if (wasOffline) {
+        await logActivity(
+          'operator',
+          'Opérateur disponible',
+          `${req.user.firstName} ${req.user.lastName}`
+        );
+      }
+    }
+
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/operators/queue
+ *
+ * File de travail dédiée à l'opérateur connecté.
+ *
+ * Les commandes reportées arrivées à échéance sont
+ * réactivées automatiquement avant le chargement.
+ */
+router.get(
+  '/queue',
+  auth,
+  authorize('operator'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(403).json({
+          error:
+            'Aucune boutique associée à cet opérateur.'
+        });
+      }
+
+      const result =
+        await queueService.getOperatorQueue(
+          req.user._id,
+          req.user.shopId,
+          req.query.limit || 50
+        );
+
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 
 // Get next order for operator
 router.get('/next-order', auth, authorize('operator'), async (req, res, next) => {
@@ -46,97 +131,304 @@ router.get('/stats', auth, authorize('operator'), async (req, res, next) => {
 router.get('/kpis', auth, authorize('operator'), async (req, res, next) => {
   try {
     const operatorId = req.user._id;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    const weekStart = new Date(today);
-    weekStart.setDate(weekStart.getDate() - 7);
-    const prevWeekStart = new Date(weekStart);
-    prevWeekStart.setDate(prevWeekStart.getDate() - 7);
 
-    // Confirmation rate (last 30 days)
-    const thirtyDaysAgo = new Date(today);
+    /*
+     * Avant de calculer la charge de la File,
+     * réactiver les commandes reportées dont
+     * l'échéance est arrivée.
+     */
+    await queueService.reactivateDuePostponedOrders(
+      operatorId,
+      req.user.shopId
+    );
+
+    /*
+     * Période du dashboard opérateur.
+     * Même logique fonctionnelle que le dashboard principal :
+     * 7 jours / 30 jours / 90 jours.
+     */
+    const allowedPeriods = ['7d', '30d', '90d'];
+    const requestedPeriod = String(req.query.period || '7d');
+    const selectedPeriod = allowedPeriods.includes(requestedPeriod)
+      ? requestedPeriod
+      : '7d';
+
+    const periodDays = {
+      '7d': 7,
+      '30d': 30,
+      '90d': 90
+    };
+
+    const durationDays = periodDays[selectedPeriod];
+    const durationMs = durationDays * 24 * 60 * 60 * 1000;
+
+    const now = new Date();
+
+    /*
+     * Journée courante / précédente.
+     * Ces bornes servent uniquement au KPI
+     * "Commandes confirmées aujourd'hui".
+     */
+    const todayStart = new Date(now);
+    todayStart.setHours(0, 0, 0, 0);
+
+    const tomorrowStart = new Date(todayStart);
+    tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+
+    const yesterdayStart = new Date(todayStart);
+    yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+
+    /*
+     * Période sélectionnée et période précédente
+     * de durée strictement identique.
+     */
+    const periodEnd = now;
+    const periodStart = new Date(periodEnd.getTime() - durationMs);
+
+    const previousPeriodEnd = periodStart;
+    const previousPeriodStart = new Date(
+      previousPeriodEnd.getTime() - durationMs
+    );
+
+    const makeCallHistoryMatch = (start, end, extra = {}) => ({
+      assignedOperatorId: operatorId,
+      callHistory: {
+        $elemMatch: {
+          operatorId,
+          timestamp: {
+            $gte: start,
+            $lt: end
+          },
+          ...extra
+        }
+      }
+    });
+
+    const thirtyDaysAgo = new Date(now);
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-    const [rateStats, prevWeekStats, callsToday, callsYesterday, queueCount, allOperatorRates] = await Promise.all([
-      // Current week confirmation rate
-      Order.aggregate([
-        { $match: { assignedOperatorId: operatorId, updatedAt: { $gte: weekStart } } },
-        {
-          $group: {
-            _id: null,
-            total: { $sum: 1 },
-            confirmed: { $sum: { $cond: [{ $eq: ['$status', 'confirmed'] }, 1, 0] } }
-          }
-        }
-      ]),
-      // Previous week confirmation rate
-      Order.aggregate([
-        { $match: { assignedOperatorId: operatorId, updatedAt: { $gte: prevWeekStart, $lt: weekStart } } },
-        {
-          $group: {
-            _id: null,
-            total: { $sum: 1 },
-            confirmed: { $sum: { $cond: [{ $eq: ['$status', 'confirmed'] }, 1, 0] } }
-          }
-        }
-      ]),
-      // Calls today
-      Order.countDocuments({
-        assignedOperatorId: operatorId,
-        'callHistory.operatorId': operatorId,
-        'callHistory.timestamp': { $gte: today }
-      }),
-      // Calls yesterday
-      Order.countDocuments({
-        assignedOperatorId: operatorId,
-        'callHistory.operatorId': operatorId,
-        'callHistory.timestamp': { $gte: yesterday, $lt: today }
-      }),
-      // Queue length
+    const [
+      confirmedToday,
+      confirmedYesterday,
+      confirmedOrders,
+      previousConfirmedOrders,
+      processedOrders,
+      previousProcessedOrders,
+      callsToday,
+      callsYesterday,
+      queueCount,
+      allOperatorRates
+    ] = await Promise.all([
+      /*
+       * Nombre de COMMANDES confirmées aujourd'hui
+       * par l'opérateur connecté.
+       */
+      Order.countDocuments(
+        makeCallHistoryMatch(
+          todayStart,
+          tomorrowStart,
+          { result: 'confirmed' }
+        )
+      ),
+
+      Order.countDocuments(
+        makeCallHistoryMatch(
+          yesterdayStart,
+          todayStart,
+          { result: 'confirmed' }
+        )
+      ),
+
+      /*
+       * Confirmations sur la période sélectionnée.
+       */
+      Order.countDocuments(
+        makeCallHistoryMatch(
+          periodStart,
+          periodEnd,
+          { result: 'confirmed' }
+        )
+      ),
+
+      Order.countDocuments(
+        makeCallHistoryMatch(
+          previousPeriodStart,
+          previousPeriodEnd,
+          { result: 'confirmed' }
+        )
+      ),
+
+      /*
+       * Une commande est considérée comme traitée si
+       * l'opérateur possède au moins une activité d'appel
+       * sur cette commande pendant la période.
+       *
+       * countDocuments compte chaque commande une seule fois,
+       * même si plusieurs tentatives ont été effectuées.
+       */
+      Order.countDocuments(
+        makeCallHistoryMatch(periodStart, periodEnd)
+      ),
+
+      Order.countDocuments(
+        makeCallHistoryMatch(
+          previousPeriodStart,
+          previousPeriodEnd
+        )
+      ),
+
+      /*
+       * Compatibilité temporaire avec l'ancien frontend.
+       * Ces champs seront retirés une fois le nouveau
+       * dashboard validé.
+       */
+      Order.countDocuments(
+        makeCallHistoryMatch(todayStart, tomorrowStart)
+      ),
+
+      Order.countDocuments(
+        makeCallHistoryMatch(yesterdayStart, todayStart)
+      ),
+
+      /*
+       * Même définition actuelle de la charge :
+       * commandes disponibles + commandes déjà attribuées
+       * à cet opérateur et encore à traiter.
+       */
       Order.countDocuments({
         $or: [
           { status: 'pending' },
-          { assignedOperatorId: operatorId, status: { $in: ['pending', 'called'] } }
+          {
+            assignedOperatorId: operatorId,
+            status: {
+              $in: ['pending', 'assigned', 'in_progress']
+            }
+          }
         ]
       }),
-      // All operators' confirmation rates for ranking
+
+      /*
+       * Classement conservé temporairement pour ne pas
+       * casser l'ancien dashboard avant le patch frontend.
+       */
       Order.aggregate([
-        { $match: { assignedOperatorId: { $exists: true }, updatedAt: { $gte: thirtyDaysAgo } } },
+        {
+          $match: {
+            assignedOperatorId: { $exists: true },
+            updatedAt: { $gte: thirtyDaysAgo }
+          }
+        },
         {
           $group: {
             _id: '$assignedOperatorId',
             total: { $sum: 1 },
-            confirmed: { $sum: { $cond: [{ $eq: ['$status', 'confirmed'] }, 1, 0] } }
+            confirmed: {
+              $sum: {
+                $cond: [
+                  { $eq: ['$status', 'confirmed'] },
+                  1,
+                  0
+                ]
+              }
+            }
           }
         },
         {
           $project: {
-            rate: { $cond: [{ $gt: ['$total', 0] }, { $multiply: [{ $divide: ['$confirmed', '$total'] }, 100] }, 0] }
+            rate: {
+              $cond: [
+                { $gt: ['$total', 0] },
+                {
+                  $multiply: [
+                    { $divide: ['$confirmed', '$total'] },
+                    100
+                  ]
+                },
+                0
+              ]
+            }
           }
         },
         { $sort: { rate: -1 } }
       ])
     ]);
 
-    const curRate = rateStats[0] ? (rateStats[0].confirmed / Math.max(rateStats[0].total, 1)) * 100 : 0;
-    const prevRate = prevWeekStats[0] ? (prevWeekStats[0].confirmed / Math.max(prevWeekStats[0].total, 1)) * 100 : 0;
-    const confirmationRateChange = parseFloat((curRate - prevRate).toFixed(1));
-    const callsTodayChange = callsYesterday > 0
-      ? parseFloat((((callsToday - callsYesterday) / callsYesterday) * 100).toFixed(1))
+    const confirmationRate = processedOrders > 0
+      ? (confirmedOrders / processedOrders) * 100
       : 0;
 
-    // Find rank
-    const rankIndex = allOperatorRates.findIndex(o => o._id.toString() === operatorId.toString());
-    const performanceRank = rankIndex >= 0 ? rankIndex + 1 : allOperatorRates.length + 1;
+    const previousConfirmationRate = previousProcessedOrders > 0
+      ? (previousConfirmedOrders / previousProcessedOrders) * 100
+      : 0;
+
+    /*
+     * Si la période précédente ne contient aucune donnée,
+     * on renvoie null : le frontend n'affichera pas une
+     * évolution artificielle de 0 %.
+     */
+    const calculatePercentageChange = (current, previous) => {
+      if (previous <= 0) {
+        return null;
+      }
+
+      return parseFloat(
+        (((current - previous) / previous) * 100).toFixed(1)
+      );
+    };
+
+    const confirmedTodayChange = calculatePercentageChange(
+      confirmedToday,
+      confirmedYesterday
+    );
+
+    const confirmedOrdersChange = calculatePercentageChange(
+      confirmedOrders,
+      previousConfirmedOrders
+    );
+
+    const confirmationRateChange = previousProcessedOrders > 0
+      ? parseFloat(
+          (
+            confirmationRate - previousConfirmationRate
+          ).toFixed(1)
+        )
+      : null;
+
+    const callsTodayChange = calculatePercentageChange(
+      callsToday,
+      callsYesterday
+    );
+
+    const rankIndex = allOperatorRates.findIndex(
+      (operator) =>
+        operator._id &&
+        operator._id.toString() === operatorId.toString()
+    );
+
+    const performanceRank = rankIndex >= 0
+      ? rankIndex + 1
+      : allOperatorRates.length + 1;
 
     res.json({
-      confirmationRate: parseFloat(curRate.toFixed(1)),
+      selectedPeriod,
+
+      // Nouveaux KPI demandés par le PDF
+      confirmedToday,
+      confirmedTodayChange,
+
+      confirmedOrders,
+      confirmedOrdersChange,
+
+      confirmationRate: parseFloat(
+        confirmationRate.toFixed(1)
+      ),
       confirmationRateChange,
+
+      queueLength: queueCount,
+
+      // Compatibilité temporaire avec le dashboard actuel
       callsToday,
       callsTodayChange,
-      queueLength: queueCount,
       performanceRank
     });
   } catch (error) {
@@ -240,8 +532,24 @@ router.get('/missions', auth, authorize('operator'), async (req, res, next) => {
     res.json({
       missions: missions.map(m => ({
         id: m._id,
-        title: m.title,
-        description: m.description,
+
+        // L'interface Opérateur est entièrement en français.
+        // On conserve les valeurs historiques en base pour ne pas
+        // casser la logique interne de progression des missions.
+        title:
+          m.title === 'Daily Confirmation Goal'
+            ? 'Objectif quotidien de confirmation'
+            : m.title === 'Call Streak'
+              ? 'Objectif quotidien d\'appels'
+              : m.title,
+
+        description:
+          m.description === 'Confirm 20 orders today'
+            ? 'Confirmer 20 commandes aujourd\'hui'
+            : m.description === 'Make 30 calls today'
+              ? 'Effectuer 30 appels aujourd\'hui'
+              : m.description,
+
         target: m.target,
         current: m.current,
         reward: m.reward,

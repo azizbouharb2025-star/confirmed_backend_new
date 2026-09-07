@@ -10,7 +10,7 @@ class AnalyticsService {
    * Get frontend dashboard metrics
    * Returns metrics in the format expected by the frontend
    */
-  async getFrontendDashboardMetrics(shopId = null) {
+  async getFrontendDashboardMetrics(shopId = null, period = '7d') {
       const matchStage = shopId ? { shopId } : {};
       const today = new Date();
       today.setHours(0, 0, 0, 0);
@@ -174,6 +174,230 @@ class AnalyticsService {
         ? parseFloat((allTimeRevenue / confirmedOrders).toFixed(2))
         : 0;
 
+      /*
+       * Nouveau contrat KPI du tableau de bord vendeur.
+       * Les anciennes métriques restent présentes pour garantir
+       * la compatibilité avec l'interface actuelle pendant la migration.
+       */
+      const periodDays = {
+        '7d': 7,
+        '30d': 30,
+        '90d': 90
+      };
+
+      const selectedPeriod =
+        typeof period === 'string' &&
+        Object.prototype.hasOwnProperty.call(periodDays, period)
+          ? period
+          : '7d';
+
+      const durationDays = periodDays[selectedPeriod];
+
+      const periodEnd = new Date();
+      const periodStart = new Date(
+        periodEnd.getTime() - durationDays * 24 * 60 * 60 * 1000
+      );
+
+      const previousPeriodEnd = new Date(periodStart);
+      const previousPeriodStart = new Date(
+        previousPeriodEnd.getTime() - durationDays * 24 * 60 * 60 * 1000
+      );
+
+      // Une commande ayant atteint l'un de ces statuts a déjà franchi
+      // l'étape de confirmation dans son cycle de vie.
+      //
+      // Le modèle actuel ne possède pas encore de confirmedAt fiable.
+      // On utilise donc cette règle pour la V1 du dashboard.
+      const confirmedLifecycleStatuses = [
+        'confirmed',
+        'shipped',
+        'delivered',
+        'failed_delivery'
+      ];
+
+      const getPeriodSnapshot = async (startDate, endDate) => {
+        const result = await Order.aggregate([
+          {
+            $match: {
+              ...matchStage,
+              createdAt: {
+                $gte: startDate,
+                $lt: endDate
+              }
+            }
+          },
+          {
+            $facet: {
+              totals: [
+                {
+                  $group: {
+                    _id: null,
+                    ordersReceived: {
+                      $sum: 1
+                    },
+                    ordersConfirmed: {
+                      $sum: {
+                        $cond: [
+                          {
+                            $in: [
+                              '$status',
+                              confirmedLifecycleStatuses
+                            ]
+                          },
+                          1,
+                          0
+                        ]
+                      }
+                    },
+                    potentialRevenue: {
+                      $sum: {
+                        $cond: [
+                          {
+                            $in: [
+                              '$status',
+                              confirmedLifecycleStatuses
+                            ]
+                          },
+                          '$totalAmount',
+                          0
+                        ]
+                      }
+                    }
+                  }
+                }
+              ],
+              aiScores: [
+                {
+                  $match: {
+                    status: {
+                      $in: confirmedLifecycleStatuses
+                    },
+                    aiScore: {
+                      $type: 'number'
+                    }
+                  }
+                },
+                {
+                  $group: {
+                    _id: null,
+                    averageAiScore: {
+                      $avg: '$aiScore'
+                    },
+                    scoredOrders: {
+                      $sum: 1
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]);
+
+        const totals = result?.[0]?.totals?.[0] || {};
+        const aiScores = result?.[0]?.aiScores?.[0] || {};
+
+        const received = totals.ordersReceived || 0;
+        const confirmed = totals.ordersConfirmed || 0;
+
+        return {
+          ordersReceived: received,
+          ordersConfirmed: confirmed,
+
+          confirmationRate:
+            received > 0
+              ? parseFloat(
+                  ((confirmed / received) * 100).toFixed(1)
+                )
+              : 0,
+
+          averageAiScore:
+            typeof aiScores.averageAiScore === 'number'
+              ? parseFloat(aiScores.averageAiScore.toFixed(1))
+              : null,
+
+          scoredOrders:
+            aiScores.scoredOrders || 0,
+
+          potentialRevenue:
+            typeof totals.potentialRevenue === 'number'
+              ? parseFloat(totals.potentialRevenue.toFixed(2))
+              : 0
+        };
+      };
+
+      const percentageChange = (current, previous) => {
+        if (
+          typeof current !== 'number' ||
+          typeof previous !== 'number' ||
+          previous === 0
+        ) {
+          return null;
+        }
+
+        return parseFloat(
+          (((current - previous) / previous) * 100).toFixed(1)
+        );
+      };
+
+      const [
+        currentPeriodMetrics,
+        previousPeriodMetrics
+      ] = await Promise.all([
+        getPeriodSnapshot(periodStart, periodEnd),
+        getPeriodSnapshot(previousPeriodStart, previousPeriodEnd)
+      ]);
+
+      const dashboardKpis = {
+        period: selectedPeriod,
+
+        startDate: periodStart.toISOString(),
+        endDate: periodEnd.toISOString(),
+
+        previousStartDate: previousPeriodStart.toISOString(),
+        previousEndDate: previousPeriodEnd.toISOString(),
+
+        ordersReceived: {
+          value: currentPeriodMetrics.ordersReceived,
+          change: percentageChange(
+            currentPeriodMetrics.ordersReceived,
+            previousPeriodMetrics.ordersReceived
+          )
+        },
+
+        ordersConfirmed: {
+          value: currentPeriodMetrics.ordersConfirmed,
+          change: percentageChange(
+            currentPeriodMetrics.ordersConfirmed,
+            previousPeriodMetrics.ordersConfirmed
+          )
+        },
+
+        confirmationRate: {
+          value: currentPeriodMetrics.confirmationRate,
+          change: percentageChange(
+            currentPeriodMetrics.confirmationRate,
+            previousPeriodMetrics.confirmationRate
+          )
+        },
+
+        averageAiScore: {
+          value: currentPeriodMetrics.averageAiScore,
+          change: percentageChange(
+            currentPeriodMetrics.averageAiScore,
+            previousPeriodMetrics.averageAiScore
+          ),
+          scoredOrders: currentPeriodMetrics.scoredOrders
+        },
+
+        potentialRevenue: {
+          value: currentPeriodMetrics.potentialRevenue,
+          change: percentageChange(
+            currentPeriodMetrics.potentialRevenue,
+            previousPeriodMetrics.potentialRevenue
+          )
+        }
+      };
+
       return {
         ordersReceived,
         ordersConfirmed,
@@ -186,7 +410,10 @@ class AnalyticsService {
         avgResolutionTime,
         revenue: allTimeRevenue,
         revenueChange,
-        averageOrderValue
+        averageOrderValue,
+
+        // Nouveau dashboard vendeur
+        dashboardKpis
       };
     }
 
@@ -249,7 +476,7 @@ class AnalyticsService {
       Order.find(matchStage)
         .sort({ updatedAt: -1 })
         .limit(10)
-        .select('orderId operatorFeedback status updatedAt')
+        .select('confirmedId orderId operatorFeedback status updatedAt')
         .lean()
     ]);
 
@@ -260,6 +487,7 @@ class AnalyticsService {
       }, {}),
       totalWithFeedback: feedbackStats.reduce((sum, s) => sum + s.count, 0),
       recentFeedback: recentFeedback.map(f => ({
+        confirmedId: f.confirmedId,
         orderId: f.orderId,
         feedback: f.operatorFeedback,
         status: f.status,
@@ -739,7 +967,7 @@ class AnalyticsService {
         .sort({ updatedAt: -1 })
         .limit(10)
         .populate('assignedOperatorId', 'name')
-        .select('orderId status updatedAt clientInfo.name')
+        .select('confirmedId orderId status updatedAt clientInfo.name')
     ]);
 
     return {

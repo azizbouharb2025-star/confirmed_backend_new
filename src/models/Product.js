@@ -15,20 +15,37 @@ const productSchema = new mongoose.Schema({
   },
   productLink: {
     type: String,
-    required: true
+    default: ''
   },
   price: {
     type: Number,
+    min: 0,
+    default: 0
+  },
+  deliveryFee: {
+    type: Number,
+    min: 0,
     default: 0
   },
   sku: String,
   description: {
     type: String,
-    required: true
+    default: ''
   },
+
+  // Instructions du propriétaire de la boutique destinées
+  // à l'opérateur pendant l'appel.
+  sellerNotes: {
+    type: String,
+    default: ''
+  },
+
   imageUrl: {
     type: String,
-    required: true
+    default: ''
+  },
+  imageUploadedAt: {
+    type: Date
   },
   category: String,
   inStock: {

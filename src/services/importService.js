@@ -1,6 +1,7 @@
 const XLSX = require('xlsx');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../utils/logger');
+const aiScoringService = require('./aiScoringService');
 
 /**
  * Column alias mappings for AI column detection.
@@ -22,7 +23,8 @@ const COLUMN_ALIASES = {
     'téléphone', 'telephone', 'tel', 'phone', 'mobile', 'phone number',
     'numéro', 'numero', 'contact', 'gsm', 'portable', 'num', 'phone_number',
     'billing phone', 'shipping phone', 'mobile phone', 'numéro de téléphone',
-    'num_tel', 'tel_client', 'phone1', 'contact_phone'
+    'num_tel', 'tel_client', 'phone1', 'contact_phone',
+    'tel 1', 'tél 1', 'telephone 1', 'téléphone 1'
   ],
   region: [
     'gouvernorat', 'gouvernement', 'region', 'state', 'ville principale',
@@ -32,6 +34,10 @@ const COLUMN_ALIASES = {
   city: [
     'ville', 'city', 'localité', 'localite', 'commune', 'municipality',
     'shipping city', 'billing city', 'cité', 'cite', 'town'
+  ],
+  district: [
+    'district', 'délégation', 'delegation', 'delegation intigo',
+    'district livraison', 'delivery district'
   ],
   address: [
     'adresse', 'address', 'shipping address', 'delivery address',
@@ -58,7 +64,8 @@ const COLUMN_ALIASES = {
   ],
   quantity: [
     'quantité', 'quantite', 'qty', 'quantity', 'qte', 'nb', 'nombre',
-    'count', 'units', 'qté', 'unit', 'qty_ordered', 'quantite_commandee'
+    'count', 'units', 'qté', 'unit', 'qty_ordered', 'quantite_commandee',
+    'nombre d articles', "nombre d'articles", 'nombre articles'
   ],
   orderId: [
     'id commande', 'order id', 'order number', 'num commande', 'numéro commande',
@@ -140,7 +147,18 @@ function detectColumnField(rawHeader) {
  * @returns {{ headers: string[], rows: object[] }}
  */
 function parseFileBuffer(buffer, mimetype) {
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
+  const isCsv =
+    mimetype === 'text/csv' ||
+    mimetype === 'application/csv' ||
+    mimetype === 'text/plain';
+
+  const workbook = isCsv
+    ? XLSX.read(
+        buffer.toString('utf8').replace(/^\uFEFF/, ''),
+        { type: 'string', raw: true }
+      )
+    : XLSX.read(buffer, { type: 'buffer' });
+
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
   
@@ -228,7 +246,7 @@ function detectColumnMappingWithScores(headers) {
   const FIELD_PRIORITY = [
     'deliveryCost', 'orderId', 'clientPhone', 'clientName',
     'totalAmount', 'productName', 'quantity',
-    'region', 'city', 'address', 'notes'
+    'region', 'city', 'district', 'address', 'notes'
   ];
 
   const claimedHeaders = new Set();  // headerIdx
@@ -237,16 +255,44 @@ function detectColumnMappingWithScores(headers) {
   // fieldWinner[field] = { headerIdx, score }
   const fieldWinner = {};
 
+  // PASS 1: exact matches first
   for (const field of FIELD_PRIORITY) {
-    let bestIdx = -1, bestScore = 0;
+    let exactIdx = -1;
+
+    headers.forEach((_, idx) => {
+      if (exactIdx >= 0) return;
+      if (claimedHeaders.has(idx)) return;
+
+      const score = rawScores[idx][field] ?? 0;
+      if (score === 100) {
+        exactIdx = idx;
+      }
+    });
+
+    if (exactIdx >= 0) {
+      fieldWinner[field] = { headerIdx: exactIdx, score: 100 };
+      claimedHeaders.add(exactIdx);
+      claimedFields.add(field);
+    }
+  }
+
+  // PASS 2: fuzzy matches only for remaining fields/headers
+  for (const field of FIELD_PRIORITY) {
+    if (claimedFields.has(field)) continue;
+
+    let bestIdx = -1;
+    let bestScore = 0;
+
     headers.forEach((_, idx) => {
       if (claimedHeaders.has(idx)) return;
+
       const score = rawScores[idx][field] ?? 0;
-      if (score > bestScore && score >= MIN_SCORE) {
+      if (score >= MIN_SCORE && score < 100 && score > bestScore) {
         bestScore = score;
         bestIdx = idx;
       }
     });
+
     if (bestIdx >= 0) {
       fieldWinner[field] = { headerIdx: bestIdx, score: bestScore };
       claimedHeaders.add(bestIdx);
@@ -515,6 +561,7 @@ function rowToOrderPayload(row, shopId) {
         street: row.address || '',
         city: row.city || '',
         state: row.region || '',
+        district: row.district || '',
         zipCode: '',
         country: 'TN'
       }
@@ -526,6 +573,7 @@ function rowToOrderPayload(row, shopId) {
       sku: ''
     }],
     totalAmount: amount,
+    region: row.region || '',
     status: 'pending',
     priority: 'medium'
   };
@@ -650,6 +698,9 @@ async function processImport(fileBuffer, mimetype, options = {}) {
     try {
       const payload = rowToOrderPayload(mappedRows[preview.rowIndex], shopId);
       const order = new Order(payload);
+
+      aiScoringService.enrichOrder(order);
+
       await order.save();
       importedOrders.push(order._id);
     } catch (err) {
@@ -700,6 +751,49 @@ async function processImport(fileBuffer, mimetype, options = {}) {
     });
   }
   
+  // Admin activity feed: real import result
+  try {
+    const { logActivity } = require('./activityLogService');
+    const Shop = require('../models/Shop');
+
+    let shopLabel = `Boutique ${shopId}`;
+
+    try {
+      const activityShop = await Shop.findById(shopId)
+        .select('name')
+        .lean();
+
+      if (activityShop?.name) {
+        shopLabel = activityShop.name;
+      }
+    } catch (_) {
+      // Le nom de la boutique est secondaire :
+      // l'import lui-même ne doit jamais échouer pour cela.
+    }
+
+    const totalImportErrors =
+      rejectedCount + importErrors.length;
+
+    await logActivity(
+      'import',
+      'Import terminé',
+      `${shopLabel} : ${importedOrders.length} commande(s) importée(s) avec succès${totalImportErrors > 0 ? `, ${totalImportErrors} erreur(s)` : ''}`
+    );
+
+    if (totalImportErrors > 0) {
+      await logActivity(
+        'import',
+        'Erreur d’importation',
+        `${shopLabel} : ${totalImportErrors} erreur(s) détectée(s) dans ${fileName}`
+      );
+    }
+  } catch (activityErr) {
+    logger.error(
+      'Failed to write import activity:',
+      activityErr.message
+    );
+  }
+
   return {
     success: true,
     fileName,

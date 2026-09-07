@@ -152,12 +152,14 @@ function getMinimumTierForFeature(feature) {
 function getTierFilters(tier, query) {
   const filteredQuery = { ...query };
   
-  // Pro+ tier filters: aiScoreMin, aiScoreMax
+  // Pro+ tier filters: AI score, decision and risk level
   if (!tierMeetsMinimum(tier, 'pro')) {
     delete filteredQuery.aiScoreMin;
     delete filteredQuery.aiScoreMax;
+    delete filteredQuery.aiDecision;
+    delete filteredQuery.riskLevel;
   }
-  
+
   // Business+ tier filters: region, courier
   if (!tierMeetsMinimum(tier, 'business')) {
     delete filteredQuery.region;

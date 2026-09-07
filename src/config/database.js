@@ -28,6 +28,7 @@ const createIndexes = async () => {
       { collection: 'orders', index: { shopId: 1, status: 1 }, options: { name: 'shop_status_idx' } },
       { collection: 'orders', index: { assignedOperatorId: 1 }, options: { name: 'operator_idx' } },
       { collection: 'orders', index: { orderId: 1, shopId: 1 }, options: { unique: true, name: 'order_shop_unique' } },
+      { collection: 'orders', index: { confirmedId: 1 }, options: { unique: true, sparse: true, name: 'confirmed_id_unique' } },
       { collection: 'shops', index: { domain: 1 }, options: { unique: true, name: 'domain_unique' } },
       { collection: 'users', index: { email: 1 }, options: { unique: true, name: 'email_unique' } }
     ];

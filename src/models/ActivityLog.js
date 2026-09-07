@@ -3,7 +3,16 @@ const mongoose = require('mongoose');
 const activityLogSchema = new mongoose.Schema({
   type: {
     type: String,
-    enum: ['user', 'order', 'system', 'payment'],
+    enum: [
+      'user',
+      'operator',
+      'shop',
+      'order',
+      'import',
+      'export',
+      'system',
+      'payment'
+    ],
     required: true
   },
   action: {

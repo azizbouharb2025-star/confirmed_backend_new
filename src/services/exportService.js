@@ -150,13 +150,23 @@ class ExportService {
    */
   static mapOrderToIntigo(order) {
     const address = order.clientInfo?.address || {};
+
     return {
-      'Nom':       order.clientInfo?.name    || '',
-      'Téléphone': order.clientInfo?.phone   || '',
-      'Adresse':   ExportService.buildAddress(address),
-      'Ville':     address.city              || order.region || '',
-      'Montant':   order.totalAmount         != null ? order.totalAmount : '',
-      'Produit':   ExportService.formatItems(order.items)
+      nom_destinataire: order.clientInfo?.name || '',
+      telephone: order.clientInfo?.phone || '',
+      telephone2: '',
+      adresse: address.street || '',
+      // Intigo nomme ce champ "ville", mais il attend le Gouvernorat.
+      ville: address.state || order.region || '',
+      // Intigo attend ici la Délégation.
+      district: address.district || '',
+      quartier: '',
+      montant: order.totalAmount != null ? order.totalAmount : '',
+      taille_colis: '',
+      // Intigo : 0 = colis scellé, 1 = ouverture autorisée.
+      ouvrir_colis: 0,
+      description_produit: ExportService.formatItems(order.items),
+      info_supplementaire: ''
     };
   }
 
@@ -187,7 +197,20 @@ class ExportService {
   async exportIntigoCSV(orderIds, user) {
     try {
       const orders = await this.fetchOrdersForExport(orderIds, user);
-      const headers = ['Nom', 'Téléphone', 'Adresse', 'Ville', 'Montant', 'Produit'];
+      const headers = [
+        'nom_destinataire',
+        'telephone',
+        'telephone2',
+        'adresse',
+        'ville',
+        'district',
+        'quartier',
+        'montant',
+        'taille_colis',
+        'ouvrir_colis',
+        'description_produit',
+        'info_supplementaire'
+      ];
       const rows = orders.map(order => {
         const row = ExportService.mapOrderToIntigo(order);
         return headers.map(h => escapeCSVField(row[h])).join(',');
@@ -209,7 +232,20 @@ class ExportService {
   async exportIntigoXLSX(orderIds, user) {
     try {
       const orders = await this.fetchOrdersForExport(orderIds, user);
-      const headers = ['Nom', 'Téléphone', 'Adresse', 'Ville', 'Montant', 'Produit'];
+      const headers = [
+        'nom_destinataire',
+        'telephone',
+        'telephone2',
+        'adresse',
+        'ville',
+        'district',
+        'quartier',
+        'montant',
+        'taille_colis',
+        'ouvrir_colis',
+        'description_produit',
+        'info_supplementaire'
+      ];
       const data = [
         headers,
         ...orders.map(order => {
@@ -220,10 +256,142 @@ class ExportService {
       const ws = XLSX.utils.aoa_to_sheet(data);
       ExportService.autoSizeWorksheetColumns(ws, data);
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Intigo');
+      XLSX.utils.book_append_sheet(wb, ws, 'Colis');
       return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     } catch (error) {
       logger.error('Error exporting Intigo XLSX:', error);
+      throw error;
+    }
+  }
+
+
+  // ─── COLISSIMO EXPORT ──────────────────────────────────────────────────────
+
+  /**
+   * Map a single order to the official Colissimo Pickup template.
+   */
+  static mapOrderToColissimo(order) {
+    const address = order.clientInfo?.address || {};
+    const delivery = order.deliveryInfo || {};
+
+    const nombreArticles = Array.isArray(order.items)
+      ? order.items.reduce(
+          (sum, item) => sum + (Number(item.quantity) || 0),
+          0
+        )
+      : 0;
+
+    return {
+      'Nom': order.clientInfo?.name || '',
+      'Gouvernerat': address.state || order.region || '',
+      'Ville': address.city || '',
+      'Localité': address.district || '',
+      'Adresse': address.street || '',
+      'code postal': address.zipCode || '',
+      'Telephone': order.clientInfo?.phone || '',
+      'Telephone2': delivery.secondaryPhone || '',
+      'Prix': order.totalAmount != null ? order.totalAmount : '',
+      'Nombre_articles': nombreArticles,
+      'Designation': ExportService.formatItems(order.items),
+
+      // Valeurs sûres par défaut pour l'import Colissimo.
+      'Fragile(0/1)': 0,
+      'Ouvrir(0/1)': 0,
+      'Echange(0/1)': 0,
+      'Article echange': '',
+      'Nb echange': 0,
+
+      'Commentaire': delivery.comment || ''
+    };
+  }
+
+  /**
+   * Export selected orders in Colissimo CSV format.
+   */
+  async exportColissimoCSV(orderIds, user) {
+    try {
+      const orders = await this.fetchOrdersForExport(orderIds, user);
+
+      const headers = [
+        'Nom',
+        'Gouvernerat',
+        'Ville',
+        'Localité',
+        'Adresse',
+        'code postal',
+        'Telephone',
+        'Telephone2',
+        'Prix',
+        'Nombre_articles',
+        'Designation',
+        'Fragile(0/1)',
+        'Ouvrir(0/1)',
+        'Echange(0/1)',
+        'Article echange',
+        'Nb echange',
+        'Commentaire'
+      ];
+
+      const rows = orders.map(order => {
+        const row = ExportService.mapOrderToColissimo(order);
+        return headers.map(h => escapeCSVField(row[h])).join(',');
+      });
+
+      return '\uFEFF' +
+        [headers.map(escapeCSVField).join(','), ...rows].join('\n');
+    } catch (error) {
+      logger.error('Error exporting Colissimo CSV:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Export selected orders using the official Colissimo Pickup columns.
+   */
+  async exportColissimoXLSX(orderIds, user) {
+    try {
+      const orders = await this.fetchOrdersForExport(orderIds, user);
+
+      const headers = [
+        'Nom',
+        'Gouvernerat',
+        'Ville',
+        'Localité',
+        'Adresse',
+        'code postal',
+        'Telephone',
+        'Telephone2',
+        'Prix',
+        'Nombre_articles',
+        'Designation',
+        'Fragile(0/1)',
+        'Ouvrir(0/1)',
+        'Echange(0/1)',
+        'Article echange',
+        'Nb echange',
+        'Commentaire'
+      ];
+
+      const data = [
+        headers,
+        ...orders.map(order => {
+          const row = ExportService.mapOrderToColissimo(order);
+          return headers.map(h => row[h]);
+        })
+      ];
+
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      ExportService.autoSizeWorksheetColumns(ws, data);
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Feuil1');
+
+      return XLSX.write(wb, {
+        type: 'buffer',
+        bookType: 'xlsx'
+      });
+    } catch (error) {
+      logger.error('Error exporting Colissimo XLSX:', error);
       throw error;
     }
   }

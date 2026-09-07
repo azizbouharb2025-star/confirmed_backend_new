@@ -92,6 +92,14 @@ router.post('/', auth, authorize('shop_owner'), async (req, res, next) => {
 
     await shop.save();
 
+    // Admin activity feed: real shop creation
+    const { logActivity } = require('../services/activityLogService');
+    await logActivity(
+      'system',
+      'Nouvelle boutique créée',
+      shop.name
+    );
+
     // Link shop to user
     await require('../models/User').findByIdAndUpdate(req.user._id, {
       shopId: shop._id

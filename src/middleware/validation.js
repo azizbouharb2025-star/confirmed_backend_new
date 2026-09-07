@@ -38,7 +38,7 @@ const schemas = {
   }),
 
   createOrder: Joi.object({
-    orderId: Joi.string().required(),
+    orderId: Joi.string().allow('').optional(),
     clientInfo: Joi.object({
       name: Joi.string().required(),
       phone: Joi.string().required(),
@@ -53,7 +53,7 @@ const schemas = {
   }),
 
   updateOrderStatus: Joi.object({
-    status: Joi.string().valid('pending', 'confirmed', 'called', 'delivered', 'cancelled').required(),
+    status: Joi.string().valid('pending', 'assigned', 'in_progress', 'confirmed', 'rejected', 'cancelled', 'postponed', 'shipped', 'delivered', 'failed_delivery').required(),
     notes: Joi.string()
   })
 };

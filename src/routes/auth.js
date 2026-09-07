@@ -43,19 +43,33 @@ router.post('/register', async (req, res, next) => {
       return res.status(400).json({ error: 'User already exists' });
     }
 
-    const user = new User({ email, password, firstName, lastName, phoneNumber, whatsappNumber, isWhatsappLinked, country, role });
+    // Public self-registration always requires manual CONFIRMED validation.
+    // Model defaults stay unchanged so internal/admin-created users are not affected.
+    const user = new User({
+      email,
+      password,
+      firstName,
+      lastName,
+      phoneNumber,
+      whatsappNumber,
+      isWhatsappLinked,
+      country,
+      role,
+      isActive: false,
+      accountStatus: 'pending'
+    });
+
     await user.save();
 
     // Log activity for admin feed
     const { logActivity } = require('../services/activityLogService');
     await logActivity('user', 'New user registered', email);
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN
-    });
-
+    // No JWT is issued before manual activation.
     res.status(201).json({
-      token,
+      success: true,
+      message: 'Account created and pending activation',
+      accountStatus: 'pending',
       user: {
         id: user._id,
         email: user.email,
@@ -85,13 +99,58 @@ router.post('/login', async (req, res, next) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    if (!user.isActive) {
-      return res.status(401).json({ error: 'Account is deactivated' });
+    const resolvedAccountStatus =
+      user.accountStatus === 'pending'
+        ? 'pending'
+        : (
+            user.accountStatus === 'disabled' ||
+            user.isActive === false
+              ? 'disabled'
+              : 'active'
+          );
+
+    if (resolvedAccountStatus === 'pending') {
+      return res.status(403).json({
+        error: 'Account is pending activation'
+      });
     }
+
+    if (resolvedAccountStatus === 'disabled') {
+      return res.status(401).json({
+        error: 'Account is deactivated'
+      });
+    }
+
+    const loginAt = new Date();
+
+    user.lastLogin = loginAt;
+
+    if (user.role === 'operator') {
+      user.lastActiveAt = loginAt;
+    }
+
+    await user.save();
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
       expiresIn: process.env.JWT_EXPIRES_IN
     });
+
+    // Admin activity feed: real operator login / presence
+    if (user.role === 'operator') {
+      const { logActivity } = require('../services/activityLogService');
+
+      await logActivity(
+        'operator',
+        'Opérateur connecté',
+        `${user.firstName} ${user.lastName} (${user.email})`
+      );
+
+      await logActivity(
+        'operator',
+        'Opérateur disponible',
+        `${user.firstName} ${user.lastName}`
+      );
+    }
 
     res.json({
       token,

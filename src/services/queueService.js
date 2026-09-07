@@ -8,6 +8,159 @@ class QueueService {
     this.redis = getRedisClient();
   }
 
+  /**
+   * Réactiver les commandes reportées dont la date
+   * de rappel est arrivée.
+   *
+   * Elles restent affectées au même opérateur.
+   */
+  async reactivateDuePostponedOrders(
+    operatorId,
+    shopId = null
+  ) {
+    const now = new Date();
+
+    const query = {
+      status: 'postponed',
+      assignedOperatorId: operatorId,
+      'postponement.scheduledFor': {
+        $lte: now
+      }
+    };
+
+    if (shopId) {
+      query.shopId = shopId;
+    }
+
+    const result =
+      await Order.updateMany(
+        query,
+        {
+          $set: {
+            status: 'assigned'
+          },
+
+          $push: {
+            statusHistory: {
+              status: 'assigned',
+              timestamp: now,
+              operatorId,
+              source: 'system',
+              reason:
+                'Rappel arrivé à échéance'
+            }
+          }
+        }
+      );
+
+    if (result.modifiedCount > 0) {
+      logger.info(
+        `${result.modifiedCount} commande(s) reportée(s) réactivée(s) pour l'opérateur ${operatorId}`
+      );
+    }
+
+    return result.modifiedCount;
+  }
+
+  /**
+   * File de travail réelle d'un opérateur.
+   *
+   * Contient :
+   * - commandes pending encore libres
+   * - commandes pending déjà affectées à cet opérateur
+   * - commandes assigned / in_progress de cet opérateur
+   *
+   * Les commandes d'autres opérateurs sont exclues.
+   */
+  async getOperatorQueue(
+    operatorId,
+    shopId,
+    limit = 50
+  ) {
+    await this.reactivateDuePostponedOrders(
+      operatorId,
+      shopId
+    );
+
+    const requestedLimit =
+      Number.parseInt(limit, 10);
+
+    const safeLimit =
+      Number.isFinite(requestedLimit)
+        ? Math.min(
+            100,
+            Math.max(1, requestedLimit)
+          )
+        : 50;
+
+    const query = {
+      shopId,
+
+      $or: [
+        {
+          status: 'pending',
+
+          $or: [
+            {
+              assignedOperatorId: null
+            },
+            {
+              assignedOperatorId: {
+                $exists: false
+              }
+            },
+            {
+              assignedOperatorId:
+                operatorId
+            }
+          ]
+        },
+
+        {
+          assignedOperatorId:
+            operatorId,
+
+          status: {
+            $in: [
+              'assigned',
+              'in_progress'
+            ]
+          }
+        }
+      ]
+    };
+
+    const [orders, total] =
+      await Promise.all([
+        Order.find(query)
+          .sort({
+            createdAt: -1
+          })
+          .limit(safeLimit)
+          .populate(
+            'assignedOperatorId',
+            'name firstName lastName email'
+          )
+          .populate(
+            'shopId',
+            'name domain'
+          )
+          .populate(
+            'items.productId',
+            'name price deliveryFee imageUrl productLink description sellerNotes'
+          ),
+
+        Order.countDocuments(query)
+      ]);
+
+    return {
+      orders,
+      total,
+      limit: safeLimit
+    };
+  }
+
+
   async assignNextOrder(operatorId) {
     try {
       if (!this.redis) {
@@ -91,7 +244,7 @@ class QueueService {
       for (const operator of operators) {
         const assignedCount = await Order.countDocuments({
           assignedOperatorId: operator._id,
-          status: { $in: ['pending', 'called'] }
+          status: { $in: ['pending', 'assigned', 'in_progress'] }
         });
 
         // Assign new order if operator has less than 5 pending orders

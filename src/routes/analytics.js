@@ -20,7 +20,13 @@ const router = express.Router();
 router.get('/dashboard', auth, async (req, res, next) => {
   try {
     const shopId = req.user.role === 'shop_owner' ? req.user.shopId : null;
-    const metrics = await analyticsService.getFrontendDashboardMetrics(shopId);
+    const { period = '7d' } = req.query;
+
+    const metrics = await analyticsService.getFrontendDashboardMetrics(
+      shopId,
+      period
+    );
+
     res.json(metrics);
   } catch (error) {
     next(error);

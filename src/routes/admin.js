@@ -76,6 +76,8 @@ router.get('/kpis', auth, authorize('admin'), async (req, res, next) => {
       thisWeekUsers,
       prevWeekUsers,
       totalOrders,
+      confirmedOrders,
+      cancelledOrders,
       thisWeekOrders,
       prevWeekOrders,
       thisWeekRevenue,
@@ -88,6 +90,8 @@ router.get('/kpis', auth, authorize('admin'), async (req, res, next) => {
       User.countDocuments({ createdAt: { $gte: weekStart } }),
       User.countDocuments({ createdAt: { $gte: prevWeekStart, $lt: weekStart } }),
       Order.countDocuments(),
+      Order.countDocuments({ status: 'confirmed' }),
+      Order.countDocuments({ status: 'cancelled' }),
       Order.countDocuments({ createdAt: { $gte: weekStart } }),
       Order.countDocuments({ createdAt: { $gte: prevWeekStart, $lt: weekStart } }),
       Order.aggregate([
@@ -108,11 +112,18 @@ router.get('/kpis', auth, authorize('admin'), async (req, res, next) => {
 
     const pct = (cur, prev) => prev > 0 ? parseFloat((((cur - prev) / prev) * 100).toFixed(1)) : 0;
 
+    const confirmationRate = totalOrders > 0
+      ? parseFloat(((confirmedOrders / totalOrders) * 100).toFixed(1))
+      : 0;
+
     res.json({
       totalUsers,
       totalUsersChange: pct(thisWeekUsers, prevWeekUsers),
       totalOrders,
       totalOrdersChange: pct(thisWeekOrders, prevWeekOrders),
+      confirmedOrders,
+      cancelledOrders,
+      confirmationRate,
       revenue: rev,
       revenueChange: pct(rev, prevRev),
       activeShops,
@@ -344,40 +355,217 @@ router.get('/charts/revenue', auth, authorize('admin'), async (req, res, next) =
 });
 
 // Get all users
+// Supports server-side search, role/status filters and pagination.
 router.get('/users', auth, authorize('admin'), async (req, res, next) => {
   try {
-    const { page = 1, limit = 10, role } = req.query;
-    const query = role ? { role } : {};
+    const {
+      page = 1,
+      limit = 25,
+      role,
+      status,
+      search
+    } = req.query;
 
-    const users = await User.find(query)
-      .select('-password')
-      .populate({
-        path: 'shopId',
-        populate: { path: 'subscriptionId' }
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.min(
+      Math.max(parseInt(limit, 10) || 25, 1),
+      100
+    );
+
+    const conditions = [];
+
+    if (role) {
+      conditions.push({ role });
+    }
+
+    if (status === 'pending') {
+      conditions.push({ accountStatus: 'pending' });
+    }
+
+    if (status === 'active') {
+      conditions.push({
+        $or: [
+          { accountStatus: 'active', isActive: { $ne: false } },
+          {
+            accountStatus: { $exists: false },
+            isActive: true
+          }
+        ]
+      });
+    }
+
+    if (status === 'disabled') {
+      conditions.push({
+        $or: [
+          { accountStatus: 'disabled' },
+          { isActive: false }
+        ]
+      });
+    }
+
+    if (search && String(search).trim()) {
+      const escapedSearch = String(search)
+        .trim()
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+      const regex = new RegExp(escapedSearch, 'i');
+
+      const matchingShops = await Shop.find({
+        name: regex
       })
-      .populate('subscriptionId')
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .lean();
+        .select('_id')
+        .lean();
 
-    const total = await User.countDocuments(query);
+      conditions.push({
+        $or: [
+          { firstName: regex },
+          { lastName: regex },
+          { email: regex },
+          { phoneNumber: regex },
+          {
+            shopId: {
+              $in: matchingShops.map(shop => shop._id)
+            }
+          }
+        ]
+      });
+    }
 
-    // Resolve subscription from all possible locations
+    const query =
+      conditions.length > 0
+        ? { $and: conditions }
+        : {};
+
+    const [users, total] = await Promise.all([
+      User.find(query)
+        .select('-password')
+        .populate({
+          path: 'shopId',
+          populate: { path: 'subscriptionId' }
+        })
+        .populate('subscriptionId')
+        .sort({ createdAt: -1 })
+        .limit(limitNum)
+        .skip((pageNum - 1) * limitNum)
+        .lean(),
+
+      User.countDocuments(query)
+    ]);
+
+    const shopIds = users
+      .filter(
+        user =>
+          user.role === 'shop_owner' &&
+          user.shopId &&
+          typeof user.shopId === 'object' &&
+          user.shopId._id
+      )
+      .map(user => user.shopId._id);
+
+    const operatorIds = users
+      .filter(user => user.role === 'operator')
+      .map(user => user._id);
+
+    const [
+      shopOrderCounts,
+      operatorOrderCounts
+    ] = await Promise.all([
+      shopIds.length > 0
+        ? Order.aggregate([
+            {
+              $match: {
+                shopId: { $in: shopIds }
+              }
+            },
+            {
+              $group: {
+                _id: '$shopId',
+                count: { $sum: 1 }
+              }
+            }
+          ])
+        : [],
+
+      operatorIds.length > 0
+        ? Order.aggregate([
+            {
+              $match: {
+                assignedOperatorId: {
+                  $in: operatorIds
+                }
+              }
+            },
+            {
+              $group: {
+                _id: '$assignedOperatorId',
+                count: { $sum: 1 }
+              }
+            }
+          ])
+        : []
+    ]);
+
+    const shopCountMap = new Map(
+      shopOrderCounts.map(item => [
+        String(item._id),
+        item.count
+      ])
+    );
+
+    const operatorCountMap = new Map(
+      operatorOrderCounts.map(item => [
+        String(item._id),
+        item.count
+      ])
+    );
+
     const normalizedUsers = users.map(user => {
-      // Subscription can live on the user directly or through the shop
-      const userSub = user.subscriptionId && typeof user.subscriptionId === 'object' && user.subscriptionId._id
-        ? user.subscriptionId
-        : null;
-      const shopSub = user.shopId && typeof user.shopId === 'object'
-        && user.shopId.subscriptionId && typeof user.shopId.subscriptionId === 'object'
-        && user.shopId.subscriptionId._id
-        ? user.shopId.subscriptionId
-        : null;
+      const userSub =
+        user.subscriptionId &&
+        typeof user.subscriptionId === 'object' &&
+        user.subscriptionId._id
+          ? user.subscriptionId
+          : null;
+
+      const shopSub =
+        user.shopId &&
+        typeof user.shopId === 'object' &&
+        user.shopId.subscriptionId &&
+        typeof user.shopId.subscriptionId === 'object' &&
+        user.shopId.subscriptionId._id
+          ? user.shopId.subscriptionId
+          : null;
 
       const subscription = userSub || shopSub || null;
-      const shop = user.shopId && typeof user.shopId === 'object' ? user.shopId : null;
 
-      // Build a clean response without raw ref fields
+      const shop =
+        user.shopId &&
+        typeof user.shopId === 'object'
+          ? user.shopId
+          : null;
+
+      const accountStatus =
+        user.accountStatus === 'pending'
+          ? 'pending'
+          : (
+              user.accountStatus === 'disabled' ||
+              user.isActive === false
+                ? 'disabled'
+                : 'active'
+            );
+
+      let orderCount = 0;
+
+      if (user.role === 'shop_owner' && shop?._id) {
+        orderCount =
+          shopCountMap.get(String(shop._id)) || 0;
+      }
+
+      if (user.role === 'operator') {
+        orderCount =
+          operatorCountMap.get(String(user._id)) || 0;
+      }
+
       return {
         _id: user._id,
         email: user.email,
@@ -389,8 +577,12 @@ router.get('/users', auth, authorize('admin'), async (req, res, next) => {
         isWhatsappLinked: user.isWhatsappLinked,
         country: user.country,
         isActive: user.isActive,
+        accountStatus,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
+        lastLogin: user.lastLogin || null,
+        lastActivity: user.lastLogin || null,
+        orderCount,
         shop,
         subscription
       };
@@ -398,13 +590,387 @@ router.get('/users', auth, authorize('admin'), async (req, res, next) => {
 
     res.json({
       users: normalizedUsers,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page
+      total,
+      totalPages: Math.ceil(total / limitNum),
+      currentPage: pageNum
     });
   } catch (error) {
     next(error);
   }
 });
+
+
+/**
+ * GET /api/admin/users/:id/details
+ * Full account + shop + order statistics.
+ */
+router.get(
+  '/users/:id/details',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const user = await User.findById(req.params.id)
+        .select('-password')
+        .populate({
+          path: 'shopId',
+          populate: {
+            path: 'subscriptionId'
+          }
+        })
+        .populate('subscriptionId')
+        .lean();
+
+      if (!user) {
+        return res.status(404).json({
+          error: 'User not found'
+        });
+      }
+
+      const shop =
+        user.shopId &&
+        typeof user.shopId === 'object'
+          ? user.shopId
+          : null;
+
+      const accountStatus =
+        user.accountStatus === 'pending'
+          ? 'pending'
+          : (
+              user.accountStatus === 'disabled' ||
+              user.isActive === false
+                ? 'disabled'
+                : 'active'
+            );
+
+      let orderMatch = null;
+
+      if (user.role === 'shop_owner' && shop?._id) {
+        orderMatch = {
+          shopId: shop._id
+        };
+      } else if (user.role === 'operator') {
+        orderMatch = {
+          $or: [
+            {
+              assignedOperatorId: user._id
+            },
+            {
+              confirmedByOperatorId: user._id
+            }
+          ]
+        };
+      }
+
+      let stats = {
+        totalOrders: 0,
+        confirmedOrders: 0,
+        cancelledOrders: 0,
+        postponedOrders: 0,
+        attempts: 0,
+        confirmationRate: 0,
+        averageAiScore: null
+      };
+
+      if (orderMatch) {
+        const result = await Order.aggregate([
+          {
+            $match: orderMatch
+          },
+          {
+            $group: {
+              _id: null,
+
+              totalOrders: {
+                $sum: 1
+              },
+
+              confirmedOrders: {
+                $sum: {
+                  $cond: [
+                    { $eq: ['$status', 'confirmed'] },
+                    1,
+                    0
+                  ]
+                }
+              },
+
+              cancelledOrders: {
+                $sum: {
+                  $cond: [
+                    { $eq: ['$status', 'cancelled'] },
+                    1,
+                    0
+                  ]
+                }
+              },
+
+              postponedOrders: {
+                $sum: {
+                  $cond: [
+                    { $eq: ['$status', 'postponed'] },
+                    1,
+                    0
+                  ]
+                }
+              },
+
+              attempts: {
+                $sum: {
+                  $size: {
+                    $ifNull: ['$callHistory', []]
+                  }
+                }
+              },
+
+              averageAiScore: {
+                $avg: '$aiScore'
+              }
+            }
+          }
+        ]);
+
+        if (result[0]) {
+          stats = {
+            totalOrders:
+              result[0].totalOrders || 0,
+
+            confirmedOrders:
+              result[0].confirmedOrders || 0,
+
+            cancelledOrders:
+              result[0].cancelledOrders || 0,
+
+            postponedOrders:
+              result[0].postponedOrders || 0,
+
+            attempts:
+              result[0].attempts || 0,
+
+            confirmationRate:
+              result[0].totalOrders > 0
+                ? parseFloat(
+                    (
+                      (
+                        result[0].confirmedOrders /
+                        result[0].totalOrders
+                      ) * 100
+                    ).toFixed(1)
+                  )
+                : 0,
+
+            averageAiScore:
+              typeof result[0].averageAiScore === 'number'
+                ? parseFloat(
+                    result[0].averageAiScore.toFixed(1)
+                  )
+                : null
+          };
+        }
+      }
+
+      res.json({
+        user: {
+          _id: user._id,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          email: user.email,
+          phoneNumber: user.phoneNumber,
+          whatsappNumber: user.whatsappNumber,
+          country: user.country,
+          role: user.role,
+          isActive: user.isActive,
+          accountStatus,
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt,
+          lastLogin: user.lastLogin || null
+        },
+
+        shop: shop
+          ? {
+              _id: shop._id,
+              name: shop.name,
+              domain: shop.domain,
+              platform: shop.platform,
+              createdAt: shop.createdAt,
+              isActive: shop.isActive,
+              numberOfShops: 1
+            }
+          : {
+              numberOfShops: 0
+            },
+
+        stats
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * PATCH /api/admin/users/:id
+ * Modify user and attached shop name.
+ */
+router.patch(
+  '/users/:id',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const {
+        firstName,
+        lastName,
+        email,
+        phoneNumber,
+        shopName
+      } = req.body;
+
+      const user = await User.findById(req.params.id);
+
+      if (!user) {
+        return res.status(404).json({
+          error: 'User not found'
+        });
+      }
+
+      if (
+        typeof email === 'string' &&
+        email.trim() &&
+        email.trim().toLowerCase() !== user.email
+      ) {
+        const existing = await User.findOne({
+          email: email.trim().toLowerCase(),
+          _id: { $ne: user._id }
+        });
+
+        if (existing) {
+          return res.status(409).json({
+            error: 'Email already in use'
+          });
+        }
+
+        user.email = email.trim().toLowerCase();
+      }
+
+      if (
+        typeof firstName === 'string' &&
+        firstName.trim()
+      ) {
+        user.firstName = firstName.trim();
+      }
+
+      if (
+        typeof lastName === 'string' &&
+        lastName.trim()
+      ) {
+        user.lastName = lastName.trim();
+      }
+
+      if (
+        typeof phoneNumber === 'string' &&
+        phoneNumber.trim()
+      ) {
+        user.phoneNumber = phoneNumber.trim();
+      }
+
+      await user.save();
+
+      if (
+        user.shopId &&
+        typeof shopName === 'string' &&
+        shopName.trim()
+      ) {
+        await Shop.findByIdAndUpdate(
+          user.shopId,
+          {
+            $set: {
+              name: shopName.trim()
+            }
+          }
+        );
+      }
+
+      const { logActivity } = require(
+        '../services/activityLogService'
+      );
+
+      await logActivity(
+        'user',
+        'Informations utilisateur modifiées',
+        `${user.firstName} ${user.lastName} (${user.email})`
+      );
+
+      res.json({
+        message: 'User updated successfully'
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * PATCH /api/admin/users/:id/status
+ * Explicit account status management.
+ */
+router.patch(
+  '/users/:id/status',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const { status } = req.body;
+
+      if (
+        !['pending', 'active', 'disabled'].includes(status)
+      ) {
+        return res.status(400).json({
+          error: 'Invalid account status'
+        });
+      }
+
+      const user = await User.findById(req.params.id);
+
+      if (!user) {
+        return res.status(404).json({
+          error: 'User not found'
+        });
+      }
+
+      user.accountStatus = status;
+      user.isActive = status === 'active';
+
+      await user.save();
+
+      const { logActivity } = require(
+        '../services/activityLogService'
+      );
+
+      const actionMap = {
+        pending: 'Compte utilisateur en attente',
+        active: 'Compte utilisateur activé',
+        disabled: 'Compte utilisateur désactivé'
+      };
+
+      await logActivity(
+        'user',
+        actionMap[status],
+        `${user.firstName} ${user.lastName} (${user.email})`
+      );
+
+      res.json({
+        message: 'User status updated',
+        status
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 
 // Toggle user status
 router.patch('/users/:id/toggle-status', auth, authorize('admin'), async (req, res, next) => {
@@ -415,13 +981,621 @@ router.patch('/users/:id/toggle-status', auth, authorize('admin'), async (req, r
     }
 
     user.isActive = !user.isActive;
+    user.accountStatus =
+      user.isActive ? 'active' : 'disabled';
+
     await user.save();
+
+    const { logActivity } = require('../services/activityLogService');
+
+    await logActivity(
+      'user',
+      user.isActive ? 'Compte utilisateur activé' : 'Compte utilisateur désactivé',
+      `${user.firstName} ${user.lastName} (${user.email})`
+    );
 
     res.json({ message: `User ${user.isActive ? 'activated' : 'deactivated'}` });
   } catch (error) {
     next(error);
   }
 });
+
+
+// ==========================================================
+// ADMIN - OPERATOR MANAGEMENT
+// ==========================================================
+
+/**
+ * GET /api/admin/operators
+ *
+ * Liste complète avec statistiques réelles.
+ *
+ * availabilityStatus:
+ * - disabled  : compte désactivé
+ * - busy      : au moins une commande in_progress
+ * - available : activité opérateur dans les 5 dernières minutes
+ * - offline   : aucune activité récente
+ */
+router.get(
+  '/operators',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const operators = await User.find({
+        role: 'operator'
+      })
+        .select('-password')
+        .populate(
+          'shopId',
+          'name domain platform isActive'
+        )
+        .sort({
+          createdAt: -1
+        })
+        .lean();
+
+      const operatorIds = operators.map(
+        operator => operator._id
+      );
+
+      const [
+        assignedStats,
+        processedStats,
+        confirmedStats,
+        busyStats,
+        shops
+      ] = await Promise.all([
+        operatorIds.length
+          ? Order.aggregate([
+              {
+                $match: {
+                  assignedOperatorId: {
+                    $in: operatorIds
+                  },
+                  status: {
+                    $in: [
+                      'assigned',
+                      'in_progress',
+                      'postponed'
+                    ]
+                  }
+                }
+              },
+              {
+                $group: {
+                  _id: '$assignedOperatorId',
+                  count: {
+                    $sum: 1
+                  }
+                }
+              }
+            ])
+          : [],
+
+        operatorIds.length
+          ? Order.aggregate([
+              {
+                $unwind: '$callHistory'
+              },
+              {
+                $match: {
+                  'callHistory.operatorId': {
+                    $in: operatorIds
+                  }
+                }
+              },
+              {
+                $group: {
+                  _id: '$callHistory.operatorId',
+                  orders: {
+                    $addToSet: '$_id'
+                  }
+                }
+              },
+              {
+                $project: {
+                  count: {
+                    $size: '$orders'
+                  }
+                }
+              }
+            ])
+          : [],
+
+        operatorIds.length
+          ? Order.aggregate([
+              {
+                $unwind: '$callHistory'
+              },
+              {
+                $match: {
+                  'callHistory.operatorId': {
+                    $in: operatorIds
+                  },
+                  'callHistory.result':
+                    'confirmed'
+                }
+              },
+              {
+                $group: {
+                  _id: '$callHistory.operatorId',
+                  orders: {
+                    $addToSet: '$_id'
+                  }
+                }
+              },
+              {
+                $project: {
+                  count: {
+                    $size: '$orders'
+                  }
+                }
+              }
+            ])
+          : [],
+
+        operatorIds.length
+          ? Order.aggregate([
+              {
+                $match: {
+                  assignedOperatorId: {
+                    $in: operatorIds
+                  },
+                  status: 'in_progress'
+                }
+              },
+              {
+                $group: {
+                  _id: '$assignedOperatorId',
+                  count: {
+                    $sum: 1
+                  }
+                }
+              }
+            ])
+          : [],
+
+        Shop.find({
+          isActive: true
+        })
+          .select('_id name')
+          .sort({
+            name: 1
+          })
+          .lean()
+      ]);
+
+      const toMap = data =>
+        new Map(
+          data.map(item => [
+            String(item._id),
+            item.count || 0
+          ])
+        );
+
+      const assignedMap =
+        toMap(assignedStats);
+
+      const processedMap =
+        toMap(processedStats);
+
+      const confirmedMap =
+        toMap(confirmedStats);
+
+      const busyMap =
+        toMap(busyStats);
+
+      const now = Date.now();
+
+      const result = operators.map(
+        operator => {
+          const id =
+            String(operator._id);
+
+          const accountStatus =
+            operator.accountStatus ===
+              'disabled' ||
+            operator.isActive === false
+              ? 'disabled'
+              : operator.accountStatus ===
+                  'pending'
+                ? 'pending'
+                : 'active';
+
+          const lastActiveAt =
+            operator.lastActiveAt
+              ? new Date(
+                  operator.lastActiveAt
+                )
+              : null;
+
+          const recentlyActive =
+            !!lastActiveAt &&
+            now -
+              lastActiveAt.getTime() <=
+              5 * 60 * 1000;
+
+          let availabilityStatus =
+            'offline';
+
+          if (
+            accountStatus === 'disabled'
+          ) {
+            availabilityStatus =
+              'disabled';
+          } else if (
+            (busyMap.get(id) || 0) > 0
+          ) {
+            availabilityStatus =
+              'busy';
+          } else if (recentlyActive) {
+            availabilityStatus =
+              'available';
+          }
+
+          return {
+            _id: operator._id,
+            firstName:
+              operator.firstName,
+            lastName:
+              operator.lastName,
+            email: operator.email,
+            phoneNumber:
+              operator.phoneNumber,
+            createdAt:
+              operator.createdAt,
+            lastLogin:
+              operator.lastLogin || null,
+            lastActiveAt:
+              operator.lastActiveAt ||
+              null,
+            isActive:
+              operator.isActive,
+            accountStatus,
+            availabilityStatus,
+
+            shop:
+              operator.shopId &&
+              typeof operator.shopId ===
+                'object'
+                ? operator.shopId
+                : null,
+
+            assignedOrders:
+              assignedMap.get(id) || 0,
+
+            processedOrders:
+              processedMap.get(id) || 0,
+
+            confirmedOrders:
+              confirmedMap.get(id) || 0
+          };
+        }
+      );
+
+      res.json({
+        operators: result,
+        shops
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * POST /api/admin/operators
+ * Création réelle d'un compte opérateur.
+ */
+router.post(
+  '/operators',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const {
+        firstName,
+        lastName,
+        email,
+        phoneNumber,
+        password,
+        shopId,
+        status = 'active'
+      } = req.body;
+
+      const missingFields = [];
+
+      if (!firstName)
+        missingFields.push('firstName');
+
+      if (!lastName)
+        missingFields.push('lastName');
+
+      if (!email)
+        missingFields.push('email');
+
+      if (!phoneNumber)
+        missingFields.push('phoneNumber');
+
+      if (!password)
+        missingFields.push('password');
+
+      if (!shopId)
+        missingFields.push('shopId');
+
+      if (missingFields.length > 0) {
+        return res.status(400).json({
+          error:
+            `Missing required fields: ${missingFields.join(
+              ', '
+            )}`
+        });
+      }
+
+      if (
+        typeof password !== 'string' ||
+        password.length < 6
+      ) {
+        return res.status(400).json({
+          error:
+            'Password must be at least 6 characters'
+        });
+      }
+
+      if (
+        !['active', 'disabled'].includes(
+          status
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid operator account status'
+        });
+      }
+
+      const normalizedEmail =
+        String(email)
+          .trim()
+          .toLowerCase();
+
+      const existingUser =
+        await User.findOne({
+          email: normalizedEmail
+        });
+
+      if (existingUser) {
+        return res.status(409).json({
+          error:
+            'Email already in use'
+        });
+      }
+
+      const shop =
+        await Shop.findOne({
+          _id: shopId,
+          isActive: true
+        });
+
+      if (!shop) {
+        return res.status(400).json({
+          error:
+            'Active shop not found'
+        });
+      }
+
+      const operator = new User({
+        firstName:
+          String(firstName).trim(),
+
+        lastName:
+          String(lastName).trim(),
+
+        email: normalizedEmail,
+
+        phoneNumber:
+          String(phoneNumber).trim(),
+
+        // User exige actuellement un numéro WhatsApp.
+        // Le téléphone est utilisé par défaut.
+        whatsappNumber:
+          String(phoneNumber).trim(),
+
+        isWhatsappLinked: false,
+
+        country: 'Tunisia',
+
+        password,
+
+        role: 'operator',
+
+        shopId: shop._id,
+
+        accountStatus: status,
+
+        isActive:
+          status === 'active'
+      });
+
+      await operator.save();
+
+      const { logActivity } = require(
+        '../services/activityLogService'
+      );
+
+      await logActivity(
+        'operator',
+        'Nouvel opérateur créé',
+        `${operator.firstName} ${operator.lastName} — ${shop.name}`
+      );
+
+      res.status(201).json({
+        message:
+          'Operator created successfully',
+        operator: {
+          _id: operator._id,
+          firstName:
+            operator.firstName,
+          lastName:
+            operator.lastName,
+          email: operator.email
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * PATCH /api/admin/operators/:id
+ * Modifier les données opérateur.
+ *
+ * Le mot de passe est optionnel lors d'une modification.
+ */
+router.patch(
+  '/operators/:id',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const operator =
+        await User.findOne({
+          _id: req.params.id,
+          role: 'operator'
+        });
+
+      if (!operator) {
+        return res.status(404).json({
+          error:
+            'Operator not found'
+        });
+      }
+
+      const {
+        firstName,
+        lastName,
+        email,
+        phoneNumber,
+        password,
+        shopId
+      } = req.body;
+
+      if (
+        typeof email === 'string' &&
+        email.trim()
+      ) {
+        const normalizedEmail =
+          email.trim().toLowerCase();
+
+        const duplicate =
+          await User.findOne({
+            email: normalizedEmail,
+            _id: {
+              $ne: operator._id
+            }
+          });
+
+        if (duplicate) {
+          return res.status(409).json({
+            error:
+              'Email already in use'
+          });
+        }
+
+        operator.email =
+          normalizedEmail;
+      }
+
+      if (
+        typeof firstName ===
+          'string' &&
+        firstName.trim()
+      ) {
+        operator.firstName =
+          firstName.trim();
+      }
+
+      if (
+        typeof lastName ===
+          'string' &&
+        lastName.trim()
+      ) {
+        operator.lastName =
+          lastName.trim();
+      }
+
+      if (
+        typeof phoneNumber ===
+          'string' &&
+        phoneNumber.trim()
+      ) {
+        operator.phoneNumber =
+          phoneNumber.trim();
+
+        operator.whatsappNumber =
+          phoneNumber.trim();
+      }
+
+      if (shopId) {
+        const shop =
+          await Shop.findOne({
+            _id: shopId,
+            isActive: true
+          });
+
+        if (!shop) {
+          return res.status(400).json({
+            error:
+              'Active shop not found'
+          });
+        }
+
+        operator.shopId =
+          shop._id;
+      }
+
+      if (
+        typeof password ===
+          'string' &&
+        password.length > 0
+      ) {
+        if (password.length < 6) {
+          return res.status(400).json({
+            error:
+              'Password must be at least 6 characters'
+          });
+        }
+
+        operator.password =
+          password;
+      }
+
+      await operator.save();
+
+      const { logActivity } = require(
+        '../services/activityLogService'
+      );
+
+      await logActivity(
+        'operator',
+        'Informations opérateur modifiées',
+        `${operator.firstName} ${operator.lastName} (${operator.email})`
+      );
+
+      res.json({
+        message:
+          'Operator updated successfully'
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
 
 // Plan feature definitions for subscription updates
 const PLAN_FEATURES = {
