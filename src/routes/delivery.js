@@ -3,6 +3,7 @@ const router = express.Router();
 const { auth, authorize } = require('../middleware/auth');
 const deliveryService = require('../services/deliveryService');
 const DeliveryIntegration = require('../models/DeliveryIntegration');
+const DeliveryShipment = require('../models/DeliveryShipment');
 const Order = require('../models/Order');
 
 const {
@@ -402,6 +403,158 @@ router.post(
     }
   }
 );
+
+/**
+ * GET /api/delivery/shipments/:orderId/tracking
+ *
+ * Tracking local générique.
+ *
+ * IMPORTANT :
+ * - lit uniquement MongoDB
+ * - aucun appel API transporteur
+ * - aucune mutation distante
+ * - aucune mutation locale
+ * - ne contient aucune règle spécifique Intigo
+ */
+router.get(
+  '/shipments/:orderId/tracking',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const ownership =
+        await verifyOrderOwnership(
+          req.params.orderId,
+          req.user
+        );
+
+      if (!ownership.valid) {
+        return res
+          .status(ownership.status)
+          .json({
+            error:
+              ownership.error
+          });
+      }
+
+      const shipments =
+        await DeliveryShipment.find({
+          orderId:
+            req.params.orderId,
+
+          shopId:
+            req.user.shopId,
+
+          externalId: {
+            $exists:
+              true,
+
+            $nin: [
+              null,
+              ''
+            ]
+          }
+        })
+          .sort({
+            updatedAt:
+              -1
+          })
+          .select({
+            provider:
+              1,
+
+            state:
+              1,
+
+            correlationId:
+              1,
+
+            externalId:
+              1,
+
+            providerStatusCode:
+              1,
+
+            providerStatusLabel:
+              1,
+
+            metadata:
+              1,
+
+            createdAt:
+              1,
+
+            updatedAt:
+              1
+          })
+          .lean();
+
+      const tracking =
+        shipments.map(
+          shipment => ({
+            shipmentId:
+              shipment._id,
+
+            provider:
+              shipment.provider,
+
+            state:
+              shipment.state,
+
+            correlationId:
+              shipment.correlationId ||
+              null,
+
+            trackingNumber:
+              shipment.externalId ||
+              null,
+
+            providerStatusCode:
+              shipment.providerStatusCode ??
+              null,
+
+            providerStatusLabel:
+              shipment.providerStatusLabel ||
+              null,
+
+            lastSyncedAt:
+              shipment.metadata
+                ?.lastStatusSyncAt ||
+              null,
+
+            createdAt:
+              shipment.createdAt,
+
+            updatedAt:
+              shipment.updatedAt
+          })
+        );
+
+      return res.json({
+        success:
+          true,
+
+        orderId:
+          req.params.orderId,
+
+        remoteCallPerformed:
+          false,
+
+        tracking
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 
 /**
  * GET /api/delivery/intigo/shipments/:orderId/status
