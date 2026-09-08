@@ -4,10 +4,12 @@ const { auth, authorize } = require('../middleware/auth');
 const deliveryService = require('../services/deliveryService');
 const DeliveryIntegration = require('../models/DeliveryIntegration');
 const Order = require('../models/Order');
-const DeliveryShipment = require('../models/DeliveryShipment');
-const mongoose = require('mongoose');
-const intigoClient = require('../services/delivery/intigoClient');
-const { mapOrderToIntigo } = require('../services/delivery/intigoMapper');
+
+const {
+  analyzeIntigoOrders,
+  toPublicAnalysis,
+  buildDryRunResult
+} = require('../services/delivery/intigoShipmentService');
 
 // Helper to verify order belongs to user's shop
 const verifyOrderOwnership = async (orderId, user) => {
@@ -98,243 +100,162 @@ router.get(
 /**
  * POST /api/delivery/intigo/preview
  *
- * Pré-valide les commandes sélectionnées avant tout envoi vers Intigo.
- * Aucun colis n'est créé par cette route.
- *
- * Body:
- * {
- *   "orderIds": ["<mongodb-id>", "..."]
- * }
+ * Pré-valide les commandes sélectionnées.
+ * Aucun colis Intigo n'est créé.
  */
 router.post(
   '/intigo/preview',
   auth,
   authorize('shop_owner'),
   async (req, res, next) => {
-  try {
-    if (!req.user.shopId) {
-      return res.status(400).json({
-        error: 'No shop associated with user'
-      });
-    }
-
-    const { orderIds } = req.body;
-
-    if (
-      !Array.isArray(orderIds) ||
-      orderIds.length === 0
-    ) {
-      return res.status(400).json({
-        error: 'orderIds must contain at least one order'
-      });
-    }
-
-    if (orderIds.length > 100) {
-      return res.status(400).json({
-        error: 'Maximum 100 orders per Intigo preview'
-      });
-    }
-
-    const normalizedIds = [
-      ...new Set(
-        orderIds.map(id => String(id).trim())
-      )
-    ];
-
-    const malformedIds = normalizedIds.filter(
-      id => !mongoose.Types.ObjectId.isValid(id)
-    );
-
-    if (malformedIds.length > 0) {
-      return res.status(400).json({
-        error: 'Invalid MongoDB order IDs',
-        invalidOrderIds: malformedIds
-      });
-    }
-
-    const orders = await Order.find({
-      _id: {
-        $in: normalizedIds
-      },
-      shopId: req.user.shopId
-    }).lean();
-
-    const orderById = new Map(
-      orders.map(order => [
-        String(order._id),
-        order
-      ])
-    );
-
-    const ready = [];
-    const review = [];
-    const duplicate = [];
-    const invalid = [];
-
-    const existingShipments =
-      await DeliveryShipment.find({
-        orderId: {
-          $in: normalizedIds
-        },
-        provider: 'intigo'
-      })
-        .select({
-          orderId: 1,
-          correlationId: 1,
-          externalId: 1,
-          state: 1,
-          updatedAt: 1
-        })
-        .lean();
-
-    const shipmentByOrderId = new Map(
-      existingShipments.map(shipment => [
-        String(shipment.orderId),
-        shipment
-      ])
-    );
-
-    for (const requestedId of normalizedIds) {
-      const order = orderById.get(requestedId);
-
-      if (!order) {
-        invalid.push({
-          orderId: requestedId,
-          confirmedId: null,
-          errors: [
-            'Commande introuvable ou hors de cette boutique'
-          ]
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
         });
-
-        continue;
       }
 
-      const existingShipment =
-        shipmentByOrderId.get(requestedId);
+      const analysis =
+        await analyzeIntigoOrders({
+          shopId:
+            req.user.shopId,
 
-      if (
-        existingShipment &&
-        ['preparing', 'created'].includes(
-          existingShipment.state
-        )
-      ) {
-        duplicate.push({
-          orderId: requestedId,
-          confirmedId: order.confirmedId,
-          state: existingShipment.state,
-          correlationId:
-            existingShipment.correlationId || null,
-          externalId:
-            existingShipment.externalId || null
+          orderIds:
+            req.body?.orderIds
         });
 
-        continue;
+      const result =
+        toPublicAnalysis(
+          analysis
+        );
+
+      return res.json({
+        success: true,
+        provider: 'intigo',
+        ...result
+      });
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(error.statusCode)
+          .json({
+            error:
+              error.message,
+
+            ...(error.invalidOrderIds
+              ? {
+                  invalidOrderIds:
+                    error.invalidOrderIds
+                }
+              : {})
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/delivery/intigo/shipments
+ *
+ * Etape de sécurité actuelle :
+ * SEUL dryRun=true est accepté.
+ *
+ * Aucun document DeliveryShipment n'est créé.
+ * Aucun POST n'est envoyé à Intigo.
+ *
+ * Body:
+ * {
+ *   "orderIds": ["..."],
+ *   "dryRun": true,
+ *   "allowReview": false
+ * }
+ */
+router.post(
+  '/intigo/shipments',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
       }
 
       const {
-        payload,
-        errors
-      } = mapOrderToIntigo(order);
+        orderIds,
+        dryRun,
+        allowReview = false
+      } = req.body || {};
 
-      if (errors.length > 0) {
-        invalid.push({
-          orderId: requestedId,
-          confirmedId: order.confirmedId,
-          errors
+      /*
+       * Hard safety gate.
+       *
+       * Tant que la vraie création Intigo
+       * n'est pas implémentée et validée,
+       * toute tentative dryRun=false échoue.
+       */
+      if (dryRun !== true) {
+        return res.status(409).json({
+          success: false,
+          provider: 'intigo',
+          error:
+            'Real Intigo shipment creation is currently disabled. Use dryRun=true.'
+        });
+      }
+
+      if (
+        typeof allowReview !==
+        'boolean'
+      ) {
+        return res.status(400).json({
+          error:
+            'allowReview must be a boolean'
+        });
+      }
+
+      const analysis =
+        await analyzeIntigoOrders({
+          shopId:
+            req.user.shopId,
+
+          orderIds
         });
 
-        continue;
-      }
-
-      const location =
-        await intigoClient.resolveLocation(
-          payload.city_name,
-          payload.district_name
-        );
-
-      if (!location.valid) {
-        invalid.push({
-          orderId: requestedId,
-          confirmedId: order.confirmedId,
-          errors: [location.error]
+      const result =
+        buildDryRunResult({
+          analysis,
+          allowReview
         });
 
-        continue;
+      return res.json(
+        result
+      );
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(error.statusCode)
+          .json({
+            error:
+              error.message,
+
+            ...(error.invalidOrderIds
+              ? {
+                  invalidOrderIds:
+                    error.invalidOrderIds
+                }
+              : {})
+          });
       }
 
-      const previewItem = {
-        orderId: requestedId,
-        confirmedId: order.confirmedId,
-        cid: payload.cid,
-        city_name: location.city.name,
-        district_name:
-          location.district?.name ||
-          payload.district_name ||
-          null,
-        districtResolved: Boolean(location.district),
-        price: payload.price,
-        itemCount: Array.isArray(order.items)
-          ? order.items.length
-          : 0,
-        warnings: location.warning
-          ? [location.warning]
-          : []
-      };
-
-      if (location.warning) {
-        review.push(previewItem);
-        continue;
-      }
-
-      ready.push(previewItem);
+      next(error);
     }
-
-    const integration =
-      await DeliveryIntegration.findOne({
-        shopId: req.user.shopId,
-        platform: 'intigo',
-        isActive: true
-      }).lean();
-
-    const pickupIndex =
-      integration?.settings?.pickupIndex;
-
-    const integrationReady = Boolean(
-      integration &&
-      integration.credentials?.apiKey &&
-      Number.isInteger(pickupIndex)
-    );
-
-    return res.json({
-      success: true,
-      provider: 'intigo',
-
-      integration: {
-        configured: Boolean(integration),
-        ready: integrationReady,
-        pickupIndex:
-          Number.isInteger(pickupIndex)
-            ? pickupIndex
-            : null
-      },
-
-      summary: {
-        selected: normalizedIds.length,
-        ready: ready.length,
-        review: review.length,
-        duplicate: duplicate.length,
-        invalid: invalid.length
-      },
-
-      ready,
-      review,
-      duplicate,
-      invalid
-    });
-  } catch (error) {
-    next(error);
   }
-});
+);
 
 // Create shipment
 router.post('/shipment/:orderId', auth, async (req, res, next) => {
