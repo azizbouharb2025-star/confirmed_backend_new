@@ -8,7 +8,8 @@ const Order = require('../models/Order');
 const {
   analyzeIntigoOrders,
   toPublicAnalysis,
-  buildDryRunResult
+  buildDryRunResult,
+  reserveIntigoShipments
 } = require('../services/delivery/intigoShipmentService');
 
 // Helper to verify order belongs to user's shop
@@ -135,6 +136,89 @@ router.post(
         provider: 'intigo',
         ...result
       });
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(error.statusCode)
+          .json({
+            error:
+              error.message,
+
+            ...(error.invalidOrderIds
+              ? {
+                  invalidOrderIds:
+                    error.invalidOrderIds
+                }
+              : {})
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/delivery/intigo/reservations
+ *
+ * Réservation LOCALE uniquement.
+ *
+ * - écrit DeliveryShipment(state=preparing)
+ * - aucune création chez Intigo
+ * - aucun appel POST Intigo
+ */
+router.post(
+  '/intigo/reservations',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const {
+        orderIds,
+        allowReview = false
+      } = req.body || {};
+
+      if (
+        typeof allowReview !==
+        'boolean'
+      ) {
+        return res.status(400).json({
+          error:
+            'allowReview must be a boolean'
+        });
+      }
+
+      const analysis =
+        await analyzeIntigoOrders({
+          shopId:
+            req.user.shopId,
+
+          orderIds
+        });
+
+      const result =
+        await reserveIntigoShipments({
+          shopId:
+            req.user.shopId,
+
+          userId:
+            req.user._id,
+
+          analysis,
+
+          allowReview
+        });
+
+      return res.json(
+        result
+      );
     } catch (error) {
       if (error.statusCode) {
         return res

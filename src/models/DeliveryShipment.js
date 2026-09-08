@@ -100,6 +100,23 @@ const deliveryShipmentSchema = new mongoose.Schema({
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
+  },
+
+  /*
+   * Verrou temporaire utilisé avant l'appel transporteur.
+   * Permet de résister aux doubles clics et aux 4 workers PM2.
+   */
+  reservationId: {
+    type: String,
+    trim: true
+  },
+
+  reservedAt: {
+    type: Date
+  },
+
+  reservationExpiresAt: {
+    type: Date
   }
 }, {
   timestamps: true

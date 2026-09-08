@@ -185,6 +185,7 @@ const analyzeIntigoOrders = async ({
         correlationId: 1,
         externalId: 1,
         state: 1,
+        reservationExpiresAt: 1,
         updatedAt: 1
       })
       .lean();
@@ -222,10 +223,21 @@ const analyzeIntigoOrders = async ({
     const existingShipment =
       shipmentByOrderId.get(requestedId);
 
+    const activePreparing =
+      existingShipment &&
+      existingShipment.state === 'preparing' &&
+      (
+        !existingShipment.reservationExpiresAt ||
+        new Date(
+          existingShipment.reservationExpiresAt
+        ).getTime() > Date.now()
+      );
+
     if (
       existingShipment &&
-      ['preparing', 'created'].includes(
-        existingShipment.state
+      (
+        existingShipment.state === 'created' ||
+        activePreparing
       )
     ) {
       duplicate.push({
@@ -502,8 +514,392 @@ const buildDryRunResult = ({
   };
 };
 
+
+// ─────────────────────────────────────────────────────────────
+// RESERVATION LOCALE ATOMIQUE
+// Aucun appel Intigo dans cette section.
+// ─────────────────────────────────────────────────────────────
+
+const crypto = require('crypto');
+
+const RESERVATION_TTL_MS =
+  15 * 60 * 1000;
+
+const isActivePreparingShipment = shipment => {
+  if (
+    !shipment ||
+    shipment.state !== 'preparing'
+  ) {
+    return false;
+  }
+
+  /*
+   * Ancienne réservation sans expiration :
+   * on la considère active par sécurité.
+   */
+  if (!shipment.reservationExpiresAt) {
+    return true;
+  }
+
+  return (
+    new Date(
+      shipment.reservationExpiresAt
+    ).getTime() > Date.now()
+  );
+};
+
+const reserveSingleIntigoShipment = async ({
+  shopId,
+  userId,
+  item,
+  reservationId,
+  now,
+  expiresAt
+}) => {
+  /*
+   * 1. On tente d'abord de reprendre un shipment
+   * failed/cancelled ou une réservation expirée.
+   *
+   * findOneAndUpdate est atomique sur ce document.
+   */
+  const reusable =
+    await DeliveryShipment.findOneAndUpdate(
+      {
+        orderId: item.orderId,
+        provider: 'intigo',
+
+        $or: [
+          {
+            state: {
+              $in: [
+                'failed',
+                'cancelled'
+              ]
+            }
+          },
+
+          {
+            state: 'preparing',
+            reservationExpiresAt: {
+              $lte: now
+            }
+          }
+        ]
+      },
+
+      {
+        $set: {
+          shopId,
+
+          correlationId:
+            item.cid,
+
+          state:
+            'preparing',
+
+          metadata: {
+            cityName:
+              item.city_name,
+
+            districtName:
+              item.district_name,
+
+            districtResolved:
+              item.districtResolved,
+
+            districtFallback:
+              item.districtFallback,
+
+            pickupIndex:
+              item.pickupIndex
+          },
+
+          createdBy:
+            userId,
+
+          reservationId,
+
+          reservedAt:
+            now,
+
+          reservationExpiresAt:
+            expiresAt
+        },
+
+        $unset: {
+          externalId: 1,
+          providerStatusCode: 1,
+          providerStatusLabel: 1,
+          lastError: 1
+        }
+      },
+
+      {
+        new: true
+      }
+    );
+
+  if (reusable) {
+    return {
+      status: 'reserved',
+      shipment: reusable
+    };
+  }
+
+  /*
+   * 2. Sinon création.
+   *
+   * L'index unique:
+   *   { orderId, provider }
+   *
+   * est la dernière barrière contre deux workers
+   * PM2 réservant simultanément la même commande.
+   */
+  try {
+    const shipment =
+      await DeliveryShipment.create({
+        shopId,
+
+        orderId:
+          item.orderId,
+
+        provider:
+          'intigo',
+
+        correlationId:
+          item.cid,
+
+        state:
+          'preparing',
+
+        metadata: {
+          cityName:
+            item.city_name,
+
+          districtName:
+            item.district_name,
+
+          districtResolved:
+            item.districtResolved,
+
+          districtFallback:
+            item.districtFallback,
+
+          pickupIndex:
+            item.pickupIndex
+        },
+
+        createdBy:
+          userId,
+
+        reservationId,
+
+        reservedAt:
+          now,
+
+        reservationExpiresAt:
+          expiresAt
+      });
+
+    return {
+      status: 'reserved',
+      shipment
+    };
+  } catch (error) {
+    if (error?.code !== 11000) {
+      throw error;
+    }
+
+    /*
+     * Un autre worker a gagné la course.
+     */
+    const existing =
+      await DeliveryShipment.findOne({
+        orderId:
+          item.orderId,
+
+        provider:
+          'intigo'
+      })
+        .lean();
+
+    return {
+      status: 'duplicate',
+      shipment: existing
+    };
+  }
+};
+
+const reserveIntigoShipments = async ({
+  shopId,
+  userId,
+  analysis,
+  allowReview = false
+}) => {
+  if (!analysis.integration.ready) {
+    const error = new Error(
+      'Intigo integration is not ready'
+    );
+
+    error.statusCode = 409;
+
+    throw error;
+  }
+
+  const reservationId =
+    crypto.randomUUID();
+
+  const now =
+    new Date();
+
+  const expiresAt =
+    new Date(
+      now.getTime() +
+      RESERVATION_TTL_MS
+    );
+
+  const candidates = [
+    ...analysis.ready,
+
+    ...(allowReview
+      ? analysis.review
+      : [])
+  ];
+
+  const reserved = [];
+
+  const raceDuplicates = [];
+
+  for (const item of candidates) {
+    const result =
+      await reserveSingleIntigoShipment({
+        shopId,
+        userId,
+        item,
+        reservationId,
+        now,
+        expiresAt
+      });
+
+    if (
+      result.status ===
+      'reserved'
+    ) {
+      reserved.push({
+        shipmentId:
+          String(
+            result.shipment._id
+          ),
+
+        orderId:
+          item.orderId,
+
+        confirmedId:
+          item.confirmedId,
+
+        correlationId:
+          item.cid,
+
+        state:
+          result.shipment.state
+      });
+
+      continue;
+    }
+
+    raceDuplicates.push({
+      orderId:
+        item.orderId,
+
+      confirmedId:
+        item.confirmedId,
+
+      state:
+        result.shipment?.state ||
+        'unknown',
+
+      correlationId:
+        result.shipment?.correlationId ||
+        null,
+
+      externalId:
+        result.shipment?.externalId ||
+        null
+    });
+  }
+
+  const duplicate = [
+    ...analysis.duplicate,
+    ...raceDuplicates
+  ];
+
+  const reviewBlocked =
+    allowReview
+      ? []
+      : publicList(
+          analysis.review
+        );
+
+  return {
+    success: true,
+
+    provider: 'intigo',
+
+    reservationOnly: true,
+
+    /*
+     * Cet identifiant permettra plus tard au POST réel
+     * de ne consommer que les réservations de ce batch.
+     */
+    reservationId,
+
+    reservationExpiresAt:
+      expiresAt,
+
+    allowReview:
+      Boolean(allowReview),
+
+    integration:
+      analysis.integration,
+
+    summary: {
+      selected:
+        analysis.normalizedIds.length,
+
+      ready:
+        analysis.ready.length,
+
+      review:
+        analysis.review.length,
+
+      reserved:
+        reserved.length,
+
+      reviewBlocked:
+        reviewBlocked.length,
+
+      duplicate:
+        duplicate.length,
+
+      invalid:
+        analysis.invalid.length
+    },
+
+    reserved,
+
+    reviewBlocked,
+
+    duplicate,
+
+    invalid:
+      analysis.invalid
+  };
+};
+
 module.exports = {
   analyzeIntigoOrders,
   toPublicAnalysis,
-  buildDryRunResult
+  buildDryRunResult,
+  reserveIntigoShipments,
+  isActivePreparingShipment
 };
