@@ -16,28 +16,17 @@ else
 end
 `;
 
-const isPrimaryProcess = () => {
-  const instance =
-    process.env.NODE_APP_INSTANCE;
+const redisAvailable = () => {
+  const redis =
+    getRedisClient();
 
-  if (
-    instance === undefined ||
-    instance === null ||
-    instance === ''
-  ) {
-    return true;
-  }
-
-  return String(instance) === '0';
+  return Boolean(
+    redis &&
+    redis.isOpen &&
+    redis.isReady
+  );
 };
 
-/*
- * Verrou d'exécution.
- *
- * Empêche deux créneaux différents
- * d'exécuter simultanément le même job
- * si le précédent est encore actif.
- */
 const runWithDistributedLock =
   async ({
     lockKey,
@@ -48,32 +37,33 @@ const runWithDistributedLock =
     const redis =
       getRedisClient();
 
+    /*
+     * FAIL CLOSED :
+     *
+     * Si Redis est indisponible,
+     * aucun worker n'exécute le job.
+     *
+     * On préfère rater temporairement un polling
+     * plutôt que lancer 4 fois une opération métier.
+     */
     if (
       !redis ||
       !redis.isOpen ||
       !redis.isReady
     ) {
-      if (!isPrimaryProcess()) {
-        return {
-          acquired: false,
-          executed: false,
-          mode: 'primary-fallback-skip'
-        };
-      }
-
       logger.warn(
-        `Redis unavailable for ${jobName}; ` +
-        'primary PM2 fallback used'
+        `Skipping background job ${jobName}: Redis unavailable`
       );
 
-      const result =
-        await task();
-
       return {
-        acquired: true,
-        executed: true,
-        mode: 'primary-fallback',
-        result
+        acquired:
+          false,
+
+        executed:
+          false,
+
+        mode:
+          'redis-unavailable-skip'
       };
     }
 
@@ -85,16 +75,24 @@ const runWithDistributedLock =
         lockKey,
         token,
         {
-          NX: true,
-          PX: ttlMs
+          NX:
+            true,
+
+          PX:
+            ttlMs
         }
       );
 
     if (acquired !== 'OK') {
       return {
-        acquired: false,
-        executed: false,
-        mode: 'already-running'
+        acquired:
+          false,
+
+        executed:
+          false,
+
+        mode:
+          'already-running'
       };
     }
 
@@ -103,9 +101,15 @@ const runWithDistributedLock =
         await task();
 
       return {
-        acquired: true,
-        executed: true,
-        mode: 'redis-lock',
+        acquired:
+          true,
+
+        executed:
+          true,
+
+        mode:
+          'redis-lock',
+
         result
       };
     } finally {
@@ -124,24 +128,12 @@ const runWithDistributedLock =
         );
       } catch (error) {
         logger.warn(
-          `Failed to release lock ${lockKey}: ` +
-          error.message
+          `Failed to release lock ${lockKey}: ${error.message}`
         );
       }
     }
   };
 
-/*
- * Protection cron complète.
- *
- * 1. tickKey :
- *    un seul worker gagne pour ce créneau.
- *    La clé n'est PAS supprimée à la fin.
- *
- * 2. runningKey :
- *    empêche le nouveau créneau de démarrer
- *    si l'ancien traitement est encore actif.
- */
 const runScheduledJobOnce =
   async ({
     jobKey,
@@ -153,32 +145,28 @@ const runScheduledJobOnce =
     const redis =
       getRedisClient();
 
+    /*
+     * Même politique fail-closed
+     * pour le scheduler.
+     */
     if (
       !redis ||
       !redis.isOpen ||
       !redis.isReady
     ) {
-      if (!isPrimaryProcess()) {
-        return {
-          acquired: false,
-          executed: false,
-          mode: 'primary-fallback-skip'
-        };
-      }
-
       logger.warn(
-        `Redis unavailable for ${jobName}; ` +
-        'primary PM2 fallback used'
+        `Skipping scheduled job ${jobName}: Redis unavailable`
       );
 
-      const result =
-        await task();
-
       return {
-        acquired: true,
-        executed: true,
-        mode: 'primary-fallback',
-        result
+        acquired:
+          false,
+
+        executed:
+          false,
+
+        mode:
+          'redis-unavailable-skip'
       };
     }
 
@@ -191,11 +179,6 @@ const runScheduledJobOnce =
     const tickKey =
       `${jobKey}:tick:${bucket}`;
 
-    /*
-     * Le tick reste présent suffisamment longtemps
-     * pour qu'un worker retardé ne puisse jamais
-     * relancer le même créneau.
-     */
     const tickTtlMs =
       Math.max(
         windowMs * 2,
@@ -205,21 +188,37 @@ const runScheduledJobOnce =
     const tickToken =
       crypto.randomUUID();
 
+    /*
+     * Cette clé représente LE créneau.
+     *
+     * Elle reste en Redis après exécution :
+     * un worker retardé ne peut donc jamais
+     * rejouer le même créneau.
+     */
     const tickAcquired =
       await redis.set(
         tickKey,
         tickToken,
         {
-          NX: true,
-          PX: tickTtlMs
+          NX:
+            true,
+
+          PX:
+            tickTtlMs
         }
       );
 
     if (tickAcquired !== 'OK') {
       return {
-        acquired: false,
-        executed: false,
-        mode: 'duplicate-tick',
+        acquired:
+          false,
+
+        executed:
+          false,
+
+        mode:
+          'duplicate-tick',
+
         bucket
       };
     }
@@ -244,7 +243,7 @@ const runScheduledJobOnce =
   };
 
 module.exports = {
+  redisAvailable,
   runWithDistributedLock,
-  runScheduledJobOnce,
-  isPrimaryProcess
+  runScheduledJobOnce
 };
