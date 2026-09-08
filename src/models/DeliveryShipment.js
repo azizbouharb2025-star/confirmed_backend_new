@@ -61,9 +61,11 @@ const deliveryShipmentSchema = new mongoose.Schema({
     type: String,
     enum: [
       'preparing',
+      'dispatching',
       'created',
       'failed',
-      'cancelled'
+      'cancelled',
+      'reconcile_required'
     ],
     default: 'preparing',
     required: true
@@ -117,6 +119,25 @@ const deliveryShipmentSchema = new mongoose.Schema({
 
   reservationExpiresAt: {
     type: Date
+  },
+
+  /*
+   * Dès que dispatchStartedAt existe et que state=dispatching,
+   * un appel transporteur a pu commencer.
+   *
+   * Cet état ne doit JAMAIS expirer automatiquement vers un retry.
+   */
+  dispatchStartedAt: {
+    type: Date
+  },
+
+  /*
+   * Empreinte exacte du payload envoyé au transporteur.
+   * Ne contient aucune donnée client en clair.
+   */
+  payloadHash: {
+    type: String,
+    trim: true
   }
 }, {
   timestamps: true

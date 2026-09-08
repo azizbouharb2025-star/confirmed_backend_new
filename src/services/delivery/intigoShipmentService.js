@@ -237,6 +237,8 @@ const analyzeIntigoOrders = async ({
       existingShipment &&
       (
         existingShipment.state === 'created' ||
+        existingShipment.state === 'dispatching' ||
+        existingShipment.state === 'reconcile_required' ||
         activePreparing
       )
     ) {
@@ -630,7 +632,9 @@ const reserveSingleIntigoShipment = async ({
           externalId: 1,
           providerStatusCode: 1,
           providerStatusLabel: 1,
-          lastError: 1
+          lastError: 1,
+          dispatchStartedAt: 1,
+          payloadHash: 1
         }
       },
 
@@ -1336,11 +1340,669 @@ const buildIntigoDispatchPreview = async ({
   };
 };
 
+
+const dispatchIntigoReservation = async ({
+  shopId,
+  reservationId,
+  expectedCorrelationId,
+  expectedPayloadHash,
+  confirm
+}) => {
+  /*
+   * VERROU PRINCIPAL.
+   *
+   * Il est volontairement dans le service,
+   * pas seulement dans la route.
+   */
+  if (
+    process.env.INTIGO_LIVE_DISPATCH_ENABLED !==
+    'true'
+  ) {
+    const error = new Error(
+      'Live Intigo dispatch is disabled'
+    );
+
+    error.statusCode = 409;
+    error.liveDispatchDisabled = true;
+
+    throw error;
+  }
+
+  if (confirm !== true) {
+    const error = new Error(
+      'Explicit confirmation is required'
+    );
+
+    error.statusCode = 400;
+
+    throw error;
+  }
+
+  const cleanReservationId =
+    String(reservationId || '').trim();
+
+  const cleanExpectedCid =
+    String(expectedCorrelationId || '').trim();
+
+  const cleanExpectedHash =
+    String(expectedPayloadHash || '').trim();
+
+  if (!cleanReservationId) {
+    const error = new Error(
+      'reservationId is required'
+    );
+
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (!cleanExpectedCid) {
+    const error = new Error(
+      'expectedCorrelationId is required'
+    );
+
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (
+    !/^[a-f0-9]{64}$/i.test(
+      cleanExpectedHash
+    )
+  ) {
+    const error = new Error(
+      'expectedPayloadHash must be a SHA-256 hash'
+    );
+
+    error.statusCode = 400;
+    throw error;
+  }
+
+  /*
+   * Première version LIVE :
+   * UNE SEULE commande par réservation.
+   */
+  const shipments =
+    await DeliveryShipment.find({
+      shopId,
+      provider: 'intigo',
+      reservationId:
+        cleanReservationId
+    })
+      .lean();
+
+  if (shipments.length !== 1) {
+    const error = new Error(
+      'Live Intigo dispatch requires exactly one reserved shipment'
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const shipment =
+    shipments[0];
+
+  if (shipment.state !== 'preparing') {
+    const error = new Error(
+      `Shipment is not preparing (${shipment.state})`
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  if (
+    !shipment.reservationExpiresAt ||
+    new Date(
+      shipment.reservationExpiresAt
+    ).getTime() <= Date.now()
+  ) {
+    const error = new Error(
+      'Intigo reservation has expired'
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  if (
+    shipment.correlationId !==
+    cleanExpectedCid
+  ) {
+    const error = new Error(
+      'Correlation ID confirmation mismatch'
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const order =
+    await Order.findOne({
+      _id: shipment.orderId,
+      shopId
+    })
+      .lean();
+
+  if (!order) {
+    const error = new Error(
+      'Order not found for shipment'
+    );
+
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const integration =
+    await DeliveryIntegration.findOne({
+      shopId,
+      platform: 'intigo',
+      isActive: true
+    })
+      .lean();
+
+  const apiKey =
+    integration?.credentials?.apiKey;
+
+  const baseUrl =
+    integration?.credentials?.baseUrl;
+
+  const pickupIndex =
+    integration?.settings?.pickupIndex;
+
+  if (
+    !apiKey ||
+    !Number.isInteger(pickupIndex)
+  ) {
+    const error = new Error(
+      'Intigo integration is not ready'
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  if (
+    Number.isInteger(
+      shipment.metadata?.pickupIndex
+    ) &&
+    shipment.metadata.pickupIndex !==
+      pickupIndex
+  ) {
+    const error = new Error(
+      'Pickup Intigo changed after reservation'
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const {
+    payload,
+    errors
+  } = mapOrderToIntigo(order);
+
+  if (errors.length > 0) {
+    const error = new Error(
+      errors.join(' | ')
+    );
+
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const location =
+    await intigoClient.resolveLocation(
+      payload.city_name,
+      payload.district_name
+    );
+
+  if (!location.valid) {
+    const error = new Error(
+      location.error
+    );
+
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (
+    location.warning &&
+    shipment.metadata?.districtFallback !==
+      true
+  ) {
+    const error = new Error(
+      'Destination now requires REVIEW approval'
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const finalPayload =
+    sanitizeIntigoPayload(
+      payload,
+      location,
+      pickupIndex
+    );
+
+  if (
+    finalPayload.cid !==
+    cleanExpectedCid
+  ) {
+    const error = new Error(
+      'Final correlation ID mismatch'
+    );
+
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const actualPayloadHash =
+    crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify(
+          finalPayload
+        )
+      )
+      .digest('hex');
+
+  if (
+    actualPayloadHash !==
+    cleanExpectedHash
+  ) {
+    const error = new Error(
+      'Payload changed after dispatch preview'
+    );
+
+    error.statusCode = 409;
+    error.actualPayloadHash =
+      actualPayloadHash;
+
+    throw error;
+  }
+
+  /*
+   * VERROU DURABLE AVANT TOUT APPEL RESEAU.
+   *
+   * Une fois state=dispatching :
+   * - un appel Intigo peut avoir commencé
+   * - aucune expiration de réservation ne permet un retry
+   * - un crash doit nécessiter une réconciliation
+   */
+  const dispatchStartedAt =
+    new Date();
+
+  const dispatchingShipment =
+    await DeliveryShipment.findOneAndUpdate(
+      {
+        _id:
+          shipment._id,
+
+        shopId,
+
+        provider:
+          'intigo',
+
+        state:
+          'preparing',
+
+        reservationId:
+          cleanReservationId,
+
+        reservationExpiresAt: {
+          $gt:
+            dispatchStartedAt
+        }
+      },
+
+      {
+        $set: {
+          state:
+            'dispatching',
+
+          dispatchStartedAt,
+
+          payloadHash:
+            actualPayloadHash
+        }
+      },
+
+      {
+        new: true
+      }
+    );
+
+  if (!dispatchingShipment) {
+    const error = new Error(
+      'Shipment dispatch lock could not be acquired'
+    );
+
+    error.statusCode = 409;
+
+    throw error;
+  }
+
+  /*
+   * À PARTIR D'ICI uniquement :
+   * un appel distant peut réellement commencer.
+   */
+  let remoteResult;
+
+  try {
+    remoteResult =
+      await intigoClient.createParcelByName({
+        apiKey,
+        baseUrl,
+        payload:
+          finalPayload
+      });
+  } catch (error) {
+    const remoteStatus =
+      error.response?.status;
+
+    const detail =
+      error.response?.data?.detail;
+
+    const definitiveFailure =
+      [400, 401, 402, 404, 409]
+        .includes(remoteStatus);
+
+    const nextState =
+      definitiveFailure
+        ? 'failed'
+        : 'reconcile_required';
+
+    await DeliveryShipment.updateOne(
+      {
+        _id:
+          shipment._id,
+
+        state:
+          'dispatching',
+
+        reservationId:
+          cleanReservationId
+      },
+
+      {
+        $set: {
+          state:
+            nextState,
+
+          lastError: {
+            message:
+              typeof detail === 'string'
+                ? detail
+                : error.message,
+
+            code:
+              remoteStatus || null,
+
+            at:
+              new Date()
+          }
+        },
+
+        $unset: {
+          reservationId: 1,
+          reservedAt: 1,
+          reservationExpiresAt: 1
+        }
+      }
+    );
+
+    const dispatchError =
+      new Error(
+        definitiveFailure
+          ? 'Intigo rejected shipment creation'
+          : 'Intigo result is uncertain; reconciliation required'
+      );
+
+    dispatchError.statusCode =
+      definitiveFailure
+        ? remoteStatus || 400
+        : 502;
+
+    dispatchError.shipmentState =
+      nextState;
+
+    throw dispatchError;
+  }
+
+  const nid =
+    String(
+      remoteResult?.data?.nid || ''
+    ).trim();
+
+  if (
+    remoteResult?.data?.success !== true ||
+    !nid
+  ) {
+    await DeliveryShipment.updateOne(
+      {
+        _id:
+          shipment._id,
+
+        state:
+          'dispatching',
+
+        reservationId:
+          cleanReservationId
+      },
+
+      {
+        $set: {
+          state:
+            'reconcile_required',
+
+          lastError: {
+            message:
+              'Unexpected Intigo creation response',
+
+            code:
+              remoteResult?.status ||
+              null,
+
+            at:
+              new Date()
+          }
+        },
+
+        $unset: {
+          reservationId: 1,
+          reservedAt: 1,
+          reservationExpiresAt: 1
+        }
+      }
+    );
+
+    const error = new Error(
+      'Unexpected Intigo response; reconciliation required'
+    );
+
+    error.statusCode = 502;
+    error.shipmentState =
+      'reconcile_required';
+
+    throw error;
+  }
+
+  /*
+   * Le NID Intigo est obtenu.
+   * On persiste d'abord DeliveryShipment.
+   */
+  let createdShipment;
+
+  try {
+    createdShipment =
+      await DeliveryShipment.findOneAndUpdate(
+        {
+          _id:
+            shipment._id,
+
+          state:
+            'dispatching',
+
+          reservationId:
+            cleanReservationId
+        },
+
+        {
+          $set: {
+            state:
+              'created',
+
+            externalId:
+              nid,
+
+            'metadata.remoteHttpStatus':
+              remoteResult.status,
+
+            'metadata.intigoDistrictName':
+              remoteResult.data
+                ?.district_name ||
+              location.district?.name ||
+              null,
+
+            'metadata.intigoDistrictFallback':
+              remoteResult.data
+                ?.district_fallback ??
+              null
+          },
+
+          $unset: {
+            reservationId: 1,
+            reservedAt: 1,
+            reservationExpiresAt: 1,
+            lastError: 1
+          }
+        },
+
+        {
+          new: true
+        }
+      );
+  } catch (databaseError) {
+    const error = new Error(
+      'Intigo parcel was created but local persistence failed'
+    );
+
+    /*
+     * Important :
+     * on retourne le NID pour permettre
+     * une réconciliation manuelle.
+     */
+    error.statusCode = 500;
+    error.remoteCreated = true;
+    error.nid = nid;
+
+    throw error;
+  }
+
+  if (!createdShipment) {
+    const error = new Error(
+      'Intigo parcel was created but shipment lock was lost'
+    );
+
+    error.statusCode = 409;
+    error.remoteCreated = true;
+    error.nid = nid;
+
+    throw error;
+  }
+
+  /*
+   * Synchronisation pratique du modèle Order.
+   * DeliveryShipment reste la source principale
+   * pour l'intégration transporteur.
+   */
+  let orderSyncWarning = null;
+
+  try {
+    await Order.updateOne(
+      {
+        _id:
+          order._id,
+
+        shopId
+      },
+
+      {
+        $set: {
+          'deliveryInfo.trackingNumber':
+            nid,
+
+          'deliveryInfo.carrier':
+            'Intigo'
+        }
+      }
+    );
+  } catch (error) {
+    orderSyncWarning =
+      'Shipment created but Order deliveryInfo sync failed';
+  }
+
+  return {
+    success: true,
+
+    provider:
+      'intigo',
+
+    remoteCreated:
+      true,
+
+    shipment: {
+      id:
+        String(
+          createdShipment._id
+        ),
+
+      orderId:
+        String(
+          order._id
+        ),
+
+      confirmedId:
+        order.confirmedId,
+
+      state:
+        createdShipment.state,
+
+      correlationId:
+        createdShipment.correlationId,
+
+      externalId:
+        createdShipment.externalId
+    },
+
+    intigo: {
+      nid,
+
+      districtName:
+        remoteResult.data
+          ?.district_name ||
+        null,
+
+      districtFallback:
+        remoteResult.data
+          ?.district_fallback ??
+        null
+    },
+
+    orderSyncWarning
+  };
+};
+
+
 module.exports = {
   analyzeIntigoOrders,
   toPublicAnalysis,
   buildDryRunResult,
   reserveIntigoShipments,
   isActivePreparingShipment,
-  buildIntigoDispatchPreview
+  buildIntigoDispatchPreview,
+  dispatchIntigoReservation
 };

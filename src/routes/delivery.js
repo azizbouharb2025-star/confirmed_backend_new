@@ -10,7 +10,8 @@ const {
   toPublicAnalysis,
   buildDryRunResult,
   reserveIntigoShipments,
-  buildIntigoDispatchPreview
+  buildIntigoDispatchPreview,
+  dispatchIntigoReservation
 } = require('../services/delivery/intigoShipmentService');
 
 // Helper to verify order belongs to user's shop
@@ -289,6 +290,106 @@ router.post(
               'intigo',
             error:
               error.message
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/delivery/intigo/dispatch
+ *
+ * LIVE endpoint.
+ *
+ * Protections :
+ * - shop_owner
+ * - feature flag serveur
+ * - une seule réservation
+ * - réservation non expirée
+ * - confirm=true
+ * - correlationId exact
+ * - hash SHA-256 exact
+ */
+router.post(
+  '/intigo/dispatch',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const result =
+        await dispatchIntigoReservation({
+          shopId:
+            req.user.shopId,
+
+          reservationId:
+            req.body?.reservationId,
+
+          expectedCorrelationId:
+            req.body?.expectedCorrelationId,
+
+          expectedPayloadHash:
+            req.body?.expectedPayloadHash,
+
+          confirm:
+            req.body?.confirm
+        });
+
+      return res.status(201).json(
+        result
+      );
+    } catch (error) {
+      if (
+        error.statusCode ||
+        error.remoteCreated
+      ) {
+        return res
+          .status(
+            error.statusCode ||
+            500
+          )
+          .json({
+            success:
+              false,
+
+            provider:
+              'intigo',
+
+            error:
+              error.message,
+
+            ...(error.liveDispatchDisabled
+              ? {
+                  liveDispatchDisabled:
+                    true
+                }
+              : {}),
+
+            ...(error.shipmentState
+              ? {
+                  shipmentState:
+                    error.shipmentState
+                }
+              : {}),
+
+            ...(error.remoteCreated
+              ? {
+                  remoteCreated:
+                    true,
+
+                  nid:
+                    error.nid ||
+                    null
+                }
+              : {})
           });
       }
 

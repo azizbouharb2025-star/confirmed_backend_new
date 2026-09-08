@@ -84,3 +84,5 @@ temp/
 .Trashes
 ehthumbs.db
 Thumbs.db
+# Local production secrets
+.env

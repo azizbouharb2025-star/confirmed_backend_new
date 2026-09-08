@@ -109,6 +109,34 @@ class IntigoClient {
     );
   }
 
+  async createParcelByName({
+    apiKey,
+    baseUrl = INTIGO_BASE_URL,
+    payload
+  }) {
+    const cleanBaseUrl =
+      String(baseUrl || INTIGO_BASE_URL)
+        .replace(/\/+$/, '');
+
+    const response = await axios.post(
+      `${cleanBaseUrl}/parcels/by-name`,
+      payload,
+      {
+        timeout: 15000,
+        headers: {
+          'X-API-Key': apiKey,
+          Accept: 'application/json',
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    return {
+      status: response.status,
+      data: response.data
+    };
+  }
+
   async resolveLocation(cityName, districtName) {
     const cities = await this.getCities();
 
