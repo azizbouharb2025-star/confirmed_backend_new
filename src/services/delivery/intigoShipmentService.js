@@ -1625,6 +1625,44 @@ const dispatchIntigoReservation = async ({
   }
 
   /*
+   * SECOND VERROU LIVE :
+   * allowlist explicite des CID.
+   *
+   * Même si INTIGO_LIVE_DISPATCH_ENABLED=true,
+   * aucune commande n'est envoyée si son CID
+   * n'est pas explicitement autorisé.
+   *
+   * Fail closed :
+   * allowlist absente/vide = aucun dispatch.
+   */
+  const allowedLiveCids =
+    String(
+      process.env.INTIGO_LIVE_ALLOWED_CIDS ||
+      ''
+    )
+      .split(',')
+      .map(value =>
+        value.trim()
+      )
+      .filter(Boolean);
+
+  if (
+    allowedLiveCids.length === 0 ||
+    !allowedLiveCids.includes(
+      finalPayload.cid
+    )
+  ) {
+    const error = new Error(
+      'Live Intigo dispatch is not allowed for this order'
+    );
+
+    error.statusCode = 403;
+    error.liveDispatchNotAllowed = true;
+
+    throw error;
+  }
+
+  /*
    * VERROU DURABLE AVANT TOUT APPEL RESEAU.
    *
    * Une fois state=dispatching :
