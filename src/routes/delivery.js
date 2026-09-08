@@ -107,6 +107,54 @@ router.get(
 });
 
 /**
+ * GET /api/delivery/intigo/capabilities
+ *
+ * Capacités publiques de l'intégration Intigo
+ * pour le commerçant authentifié.
+ *
+ * IMPORTANT :
+ * - aucun appel Intigo
+ * - aucune lecture/écriture MongoDB
+ * - aucune mutation distante
+ *
+ * Le vrai verrou reste aussi appliqué
+ * dans dispatchIntigoReservation().
+ */
+router.get(
+  '/intigo/capabilities',
+  auth,
+  authorize('shop_owner'),
+  async (req, res) => {
+    if (!req.user.shopId) {
+      return res.status(400).json({
+        error:
+          'No shop associated with user'
+      });
+    }
+
+    return res.json({
+      success: true,
+
+      provider:
+        'intigo',
+
+      liveDispatchEnabled:
+        process.env.INTIGO_LIVE_DISPATCH_ENABLED ===
+        'true',
+
+      requiresExplicitConfirmation:
+        true,
+
+      maxLiveOrdersPerDispatch:
+        1,
+
+      remoteCallPerformed:
+        false
+    });
+  }
+);
+
+/**
  * POST /api/delivery/intigo/preview
  *
  * Pré-valide les commandes sélectionnées.
