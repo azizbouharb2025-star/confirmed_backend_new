@@ -9,7 +9,8 @@ const {
   analyzeIntigoOrders,
   toPublicAnalysis,
   buildDryRunResult,
-  reserveIntigoShipments
+  reserveIntigoShipments,
+  buildIntigoDispatchPreview
 } = require('../services/delivery/intigoShipmentService');
 
 // Helper to verify order belongs to user's shop
@@ -233,6 +234,61 @@ router.post(
                     error.invalidOrderIds
                 }
               : {})
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/delivery/intigo/dispatch-preview
+ *
+ * Dernier contrôle avant envoi réel.
+ *
+ * - aucune requête POST Intigo
+ * - aucun changement d'état MongoDB
+ * - reconstruit le payload final
+ * - retourne uniquement des données non sensibles
+ */
+router.post(
+  '/intigo/dispatch-preview',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const result =
+        await buildIntigoDispatchPreview({
+          shopId:
+            req.user.shopId,
+
+          reservationId:
+            req.body?.reservationId
+        });
+
+      return res.json(
+        result
+      );
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(
+            error.statusCode
+          )
+          .json({
+            success: false,
+            provider:
+              'intigo',
+            error:
+              error.message
           });
       }
 

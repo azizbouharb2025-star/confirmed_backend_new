@@ -896,10 +896,451 @@ const reserveIntigoShipments = async ({
   };
 };
 
+
+const buildIntigoDispatchPreview = async ({
+  shopId,
+  reservationId
+}) => {
+  const normalizedReservationId =
+    String(
+      reservationId || ''
+    ).trim();
+
+  if (!normalizedReservationId) {
+    const error = new Error(
+      'reservationId is required'
+    );
+
+    error.statusCode = 400;
+
+    throw error;
+  }
+
+  const shipments =
+    await DeliveryShipment.find({
+      shopId,
+      provider: 'intigo',
+      reservationId:
+        normalizedReservationId
+    })
+      .lean();
+
+  if (shipments.length === 0) {
+    const error = new Error(
+      'Intigo reservation not found'
+    );
+
+    error.statusCode = 404;
+
+    throw error;
+  }
+
+  const invalidState =
+    shipments.filter(
+      shipment =>
+        shipment.state !==
+        'preparing'
+    );
+
+  if (invalidState.length > 0) {
+    const error = new Error(
+      'Reservation contains non-preparing shipments'
+    );
+
+    error.statusCode = 409;
+
+    throw error;
+  }
+
+  const now =
+    Date.now();
+
+  const expired =
+    shipments.filter(
+      shipment =>
+        !shipment.reservationExpiresAt ||
+        new Date(
+          shipment.reservationExpiresAt
+        ).getTime() <= now
+    );
+
+  if (expired.length > 0) {
+    const error = new Error(
+      'Intigo reservation has expired'
+    );
+
+    error.statusCode = 409;
+
+    throw error;
+  }
+
+  /*
+   * L'intégration est relue au dernier moment.
+   */
+  const integration =
+    await DeliveryIntegration.findOne({
+      shopId,
+      platform: 'intigo',
+      isActive: true
+    })
+      .lean();
+
+  const pickupIndex =
+    integration?.settings?.pickupIndex;
+
+  if (
+    !integration ||
+    !integration.credentials?.apiKey ||
+    !Number.isInteger(
+      pickupIndex
+    )
+  ) {
+    const error = new Error(
+      'Intigo integration is not ready'
+    );
+
+    error.statusCode = 409;
+
+    throw error;
+  }
+
+  const orderIds =
+    shipments.map(
+      shipment =>
+        shipment.orderId
+    );
+
+  const orders =
+    await Order.find({
+      _id: {
+        $in: orderIds
+      },
+      shopId
+    })
+      .lean();
+
+  const orderById =
+    new Map(
+      orders.map(
+        order => [
+          String(order._id),
+          order
+        ]
+      )
+    );
+
+  const wouldPost = [];
+  const invalid = [];
+
+  for (
+    const shipment of shipments
+  ) {
+    const order =
+      orderById.get(
+        String(
+          shipment.orderId
+        )
+      );
+
+    if (!order) {
+      invalid.push({
+        shipmentId:
+          String(
+            shipment._id
+          ),
+
+        orderId:
+          String(
+            shipment.orderId
+          ),
+
+        errors: [
+          'Commande introuvable ou hors de cette boutique'
+        ]
+      });
+
+      continue;
+    }
+
+    const {
+      payload,
+      errors
+    } = mapOrderToIntigo(
+      order
+    );
+
+    if (errors.length > 0) {
+      invalid.push({
+        shipmentId:
+          String(
+            shipment._id
+          ),
+
+        orderId:
+          String(
+            order._id
+          ),
+
+        confirmedId:
+          order.confirmedId,
+
+        errors
+      });
+
+      continue;
+    }
+
+    const location =
+      await intigoClient.resolveLocation(
+        payload.city_name,
+        payload.district_name
+      );
+
+    if (!location.valid) {
+      invalid.push({
+        shipmentId:
+          String(
+            shipment._id
+          ),
+
+        orderId:
+          String(
+            order._id
+          ),
+
+        confirmedId:
+          order.confirmedId,
+
+        errors: [
+          location.error
+        ]
+      });
+
+      continue;
+    }
+
+    /*
+     * La configuration pickup ne doit pas
+     * avoir changé depuis la réservation.
+     */
+    const reservedPickup =
+      shipment.metadata?.pickupIndex;
+
+    if (
+      Number.isInteger(
+        reservedPickup
+      ) &&
+      reservedPickup !==
+        pickupIndex
+    ) {
+      invalid.push({
+        shipmentId:
+          String(
+            shipment._id
+          ),
+
+        orderId:
+          String(
+            order._id
+          ),
+
+        confirmedId:
+          order.confirmedId,
+
+        errors: [
+          'Pickup Intigo modifié depuis la réservation'
+        ]
+      });
+
+      continue;
+    }
+
+    /*
+     * Si cette réservation avait été
+     * explicitement approuvée avec fallback,
+     * districtFallback sera true.
+     */
+    if (
+      location.warning &&
+      shipment.metadata
+        ?.districtFallback !==
+        true
+    ) {
+      invalid.push({
+        shipmentId:
+          String(
+            shipment._id
+          ),
+
+        orderId:
+          String(
+            order._id
+          ),
+
+        confirmedId:
+          order.confirmedId,
+
+        errors: [
+          'La destination nécessite désormais une validation REVIEW'
+        ]
+      });
+
+      continue;
+    }
+
+    const finalPayload =
+      sanitizeIntigoPayload(
+        payload,
+        location,
+        pickupIndex
+      );
+
+    if (
+      shipment.correlationId &&
+      shipment.correlationId !==
+        finalPayload.cid
+    ) {
+      invalid.push({
+        shipmentId:
+          String(
+            shipment._id
+          ),
+
+        orderId:
+          String(
+            order._id
+          ),
+
+        confirmedId:
+          order.confirmedId,
+
+        errors: [
+          'La référence Confirmed a changé depuis la réservation'
+        ]
+      });
+
+      continue;
+    }
+
+    /*
+     * Empreinte du payload réel.
+     *
+     * Le contenu client n'est jamais
+     * renvoyé par cette route.
+     */
+    const payloadHash =
+      crypto
+        .createHash(
+          'sha256'
+        )
+        .update(
+          JSON.stringify(
+            finalPayload
+          )
+        )
+        .digest(
+          'hex'
+        );
+
+    wouldPost.push({
+      shipmentId:
+        String(
+          shipment._id
+        ),
+
+      orderId:
+        String(
+          order._id
+        ),
+
+      confirmedId:
+        order.confirmedId,
+
+      correlationId:
+        finalPayload.cid,
+
+      currentState:
+        'preparing',
+
+      proposedState:
+        'created',
+
+      request: {
+        method:
+          'POST',
+
+        resource:
+          '/parcels/by-name'
+      },
+
+      city_name:
+        finalPayload.city_name,
+
+      district_name:
+        finalPayload.district_name ||
+        null,
+
+      pickupIndex:
+        finalPayload.pickup_index,
+
+      price:
+        finalPayload.price,
+
+      payloadHash
+    });
+  }
+
+  return {
+    success: true,
+
+    provider:
+      'intigo',
+
+    dispatchPreview:
+      true,
+
+    remoteCallPerformed:
+      false,
+
+    databaseTransitionPerformed:
+      false,
+
+    reservationId:
+      '<configured>',
+
+    reservationExpiresAt:
+      shipments[0]
+        ?.reservationExpiresAt ||
+      null,
+
+    integration: {
+      ready: true,
+
+      pickupIndex
+    },
+
+    summary: {
+      reserved:
+        shipments.length,
+
+      wouldPost:
+        wouldPost.length,
+
+      invalid:
+        invalid.length
+    },
+
+    wouldPost,
+
+    invalid
+  };
+};
+
 module.exports = {
   analyzeIntigoOrders,
   toPublicAnalysis,
   buildDryRunResult,
   reserveIntigoShipments,
-  isActivePreparingShipment
+  isActivePreparingShipment,
+  buildIntigoDispatchPreview
 };
