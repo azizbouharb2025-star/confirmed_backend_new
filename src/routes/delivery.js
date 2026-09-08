@@ -15,7 +15,8 @@ const {
 } = require('../services/delivery/intigoShipmentService');
 
 const {
-  getIntigoShipmentStatusPreview
+  getIntigoShipmentStatusPreview,
+  syncIntigoShipmentStatus
 } = require('../services/delivery/intigoStatusService');
 
 // Helper to verify order belongs to user's shop
@@ -426,6 +427,63 @@ router.get(
 
       const result =
         await getIntigoShipmentStatusPreview({
+          shopId:
+            req.user.shopId,
+
+          orderId:
+            req.params.orderId
+        });
+
+      return res.json(
+        result
+      );
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(
+            error.statusCode
+          )
+          .json({
+            success:
+              false,
+
+            provider:
+              'intigo',
+
+            error:
+              error.message
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/delivery/intigo/shipments/:orderId/sync
+ *
+ * Synchronisation explicite :
+ * - GET chez Intigo
+ * - mémorise providerStatus
+ * - peut avancer Order selon mapping sécurisé
+ * - aucun changement distant Intigo
+ */
+router.post(
+  '/intigo/shipments/:orderId/sync',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const result =
+        await syncIntigoShipmentStatus({
           shopId:
             req.user.shopId,
 

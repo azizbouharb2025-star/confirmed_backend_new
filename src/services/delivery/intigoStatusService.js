@@ -13,6 +13,10 @@ const DeliveryIntegration =
 const intigoClient =
   require('./intigoClient');
 
+const {
+  emitOrderUpdate
+} = require('../../websocket/orderEvents');
+
 /*
  * Mapping STRICTEMENT Intigo.
  *
@@ -662,8 +666,369 @@ const getIntigoShipmentStatusPreview =
     };
   };
 
+
+/*
+ * Synchronisation EXPLICITE Intigo -> Confirmed.
+ *
+ * IMPORTANT :
+ * - appel distant = GET uniquement
+ * - aucun changement chez Intigo
+ * - providerStatus toujours mémorisé
+ * - Order change uniquement si mapping autorisé
+ * - transition Order atomique pour résister
+ *   aux doubles clics / workers PM2
+ */
+const syncIntigoShipmentStatus =
+  async ({
+    shopId,
+    orderId
+  }) => {
+    /*
+     * Le preview refait toutes les vérifications :
+     * ownership, NID, CID, intégration, réponse Intigo,
+     * mapping et transition.
+     */
+    const preview =
+      await getIntigoShipmentStatusPreview({
+        shopId,
+        orderId
+      });
+
+    const syncedAt =
+      new Date();
+
+    const previousProviderStatusCode =
+      preview.local
+        .storedProviderStatusCode;
+
+    const previousProviderStatusLabel =
+      preview.local
+        .storedProviderStatusLabel;
+
+    const currentProviderStatusCode =
+      preview.intigo.status;
+
+    const currentProviderStatusLabel =
+      preview.intigo.statusLabel ||
+      null;
+
+    const sameCode =
+      (
+        previousProviderStatusCode == null &&
+        currentProviderStatusCode == null
+      ) ||
+      String(
+        previousProviderStatusCode
+      ) ===
+        String(
+          currentProviderStatusCode
+        );
+
+    const sameLabel =
+      String(
+        previousProviderStatusLabel ||
+        ''
+      ) ===
+      String(
+        currentProviderStatusLabel ||
+        ''
+      );
+
+    const providerStatusChanged =
+      !sameCode ||
+      !sameLabel;
+
+    /*
+     * 1. Toujours enregistrer le snapshot transporteur.
+     *
+     * DeliveryShipment.state reste "created".
+     * On ne transforme PAS un retour/cancel Intigo
+     * en state=cancelled, car cet état local est utilisé
+     * par le moteur de réservation/retry.
+     */
+    const shipment =
+      await DeliveryShipment
+        .findOneAndUpdate(
+          {
+            orderId:
+              preview.local.orderId,
+
+            shopId,
+
+            provider:
+              'intigo',
+
+            externalId:
+              preview.local.nid
+          },
+
+          {
+            $set: {
+              providerStatusCode:
+                currentProviderStatusCode,
+
+              providerStatusLabel:
+                currentProviderStatusLabel,
+
+              'metadata.lastStatusSyncAt':
+                syncedAt,
+
+              'metadata.intigoLifecycle':
+                preview.mapping.lifecycle,
+
+              'metadata.intigoIsDelivered':
+                preview.intigo.isDelivered,
+
+              'metadata.intigoIsReturn':
+                preview.intigo.isReturn,
+
+              'metadata.intigoDeliveryAttempts':
+                preview.intigo
+                  .deliveryAttempts,
+
+              'metadata.intigoUpdatedAt':
+                preview.intigo.updatedAt ||
+                null
+            }
+          },
+
+          {
+            new:
+              true
+          }
+        )
+        .lean();
+
+    if (!shipment) {
+      const error =
+        new Error(
+          'Intigo shipment disappeared during synchronization'
+        );
+
+      error.statusCode = 409;
+
+      throw error;
+    }
+
+    let orderChanged =
+      false;
+
+    let racePrevented =
+      false;
+
+    let orderAfter =
+      preview.local.orderStatus;
+
+    /*
+     * 2. Changer Order uniquement lorsque
+     * evaluateOrderTransition l'autorise.
+     */
+    if (
+      preview.mapping.syncEligible
+    ) {
+      const nextStatus =
+        preview.mapping
+          .proposedOrderStatus;
+
+      const reason =
+        `Intigo ${preview.intigo.status}` +
+        (
+          preview.intigo.statusLabel
+            ? ` - ${preview.intigo.statusLabel}`
+            : ''
+        );
+
+      const setFields = {
+        status:
+          nextStatus
+      };
+
+      /*
+       * Métadonnées métier d'annulation.
+       * Aucun cancellationReason spécifique n'est inventé :
+       * l'API Intigo possède plusieurs sous-types.
+       */
+      if (
+        nextStatus ===
+        'cancelled'
+      ) {
+        setFields.cancelledBy =
+          'courier';
+
+        setFields.cancelledAt =
+          syncedAt;
+      }
+
+      /*
+       * Filtrer AUSSI par ancien statut garantit :
+       * deux sync simultanées ne peuvent pas ajouter
+       * deux lignes statusHistory identiques.
+       */
+      const updatedOrder =
+        await Order.findOneAndUpdate(
+          {
+            _id:
+              preview.local.orderId,
+
+            shopId,
+
+            status:
+              preview.local.orderStatus
+          },
+
+          {
+            $set:
+              setFields,
+
+            $push: {
+              statusHistory: {
+                status:
+                  nextStatus,
+
+                timestamp:
+                  syncedAt,
+
+                source:
+                  'courier',
+
+                reason,
+
+                notes:
+                  `Intigo NID ${preview.intigo.nid}`
+              }
+            }
+          },
+
+          {
+            new:
+              true
+          }
+        );
+
+      if (updatedOrder) {
+        orderChanged =
+          true;
+
+        orderAfter =
+          updatedOrder.status;
+
+        /*
+         * Mettre à jour l'interface temps réel
+         * uniquement si Order a réellement changé.
+         */
+        emitOrderUpdate(
+          updatedOrder
+        );
+      } else {
+        /*
+         * Un autre worker/process a pu modifier Order
+         * après notre GET Intigo.
+         *
+         * On ne force jamais l'écriture.
+         */
+        racePrevented =
+          true;
+
+        const currentOrder =
+          await Order.findOne({
+            _id:
+              preview.local.orderId,
+
+            shopId
+          })
+            .select(
+              'status'
+            )
+            .lean();
+
+        orderAfter =
+          currentOrder?.status ||
+          null;
+      }
+    }
+
+    return {
+      success:
+        true,
+
+      provider:
+        'intigo',
+
+      readOnly:
+        false,
+
+      remoteMutationPerformed:
+        false,
+
+      remoteCall: {
+        method:
+          'GET',
+
+        resource:
+          '/parcels/{nid}'
+      },
+
+      syncedAt,
+
+      shipment: {
+        orderId:
+          preview.local.orderId,
+
+        confirmedId:
+          preview.local.confirmedId,
+
+        state:
+          shipment.state,
+
+        nid:
+          shipment.externalId,
+
+        cid:
+          shipment.correlationId,
+
+        previousProviderStatusCode:
+          previousProviderStatusCode ??
+          null,
+
+        previousProviderStatusLabel:
+          previousProviderStatusLabel ??
+          null,
+
+        providerStatusCode:
+          shipment.providerStatusCode,
+
+        providerStatusLabel:
+          shipment.providerStatusLabel ||
+          null,
+
+        providerStatusChanged
+      },
+
+      intigo:
+        preview.intigo,
+
+      mapping:
+        preview.mapping,
+
+      order: {
+        before:
+          preview.local.orderStatus,
+
+        after:
+          orderAfter,
+
+        changed:
+          orderChanged,
+
+        racePrevented
+      }
+    };
+  };
+
+
 module.exports = {
   mapIntigoStatus,
   evaluateOrderTransition,
-  getIntigoShipmentStatusPreview
+  getIntigoShipmentStatusPreview,
+  syncIntigoShipmentStatus
 };
