@@ -30,7 +30,31 @@ const createIndexes = async () => {
       { collection: 'orders', index: { orderId: 1, shopId: 1 }, options: { unique: true, name: 'order_shop_unique' } },
       { collection: 'orders', index: { confirmedId: 1 }, options: { unique: true, sparse: true, name: 'confirmed_id_unique' } },
       { collection: 'shops', index: { domain: 1 }, options: { unique: true, name: 'domain_unique' } },
-      { collection: 'users', index: { email: 1 }, options: { unique: true, name: 'email_unique' } }
+      { collection: 'users', index: { email: 1 }, options: { unique: true, name: 'email_unique' } },
+      {
+        collection: 'deliveryshipments',
+        index: { orderId: 1, provider: 1 },
+        options: {
+          unique: true,
+          name: 'delivery_order_provider_unique'
+        }
+      },
+      {
+        collection: 'deliveryshipments',
+        index: { provider: 1, externalId: 1 },
+        options: {
+          unique: true,
+          sparse: true,
+          name: 'delivery_provider_external_unique'
+        }
+      },
+      {
+        collection: 'deliveryshipments',
+        index: { shopId: 1, provider: 1, state: 1 },
+        options: {
+          name: 'delivery_shop_provider_state'
+        }
+      }
     ];
 
     for (const { collection, index, options } of indexOperations) {

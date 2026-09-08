@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const { auth } = require('../middleware/auth');
+const { auth, authorize } = require('../middleware/auth');
 const deliveryService = require('../services/deliveryService');
 const DeliveryIntegration = require('../models/DeliveryIntegration');
 const Order = require('../models/Order');
+const DeliveryShipment = require('../models/DeliveryShipment');
 const mongoose = require('mongoose');
 const intigoClient = require('../services/delivery/intigoClient');
 const { mapOrderToIntigo } = require('../services/delivery/intigoMapper');
@@ -46,7 +47,11 @@ const serializeIntegration = integration => {
 };
 
 // Setup delivery integration
-router.post('/integration', auth, async (req, res, next) => {
+router.post(
+  '/integration',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
   try {
     if (!req.user.shopId) {
       return res.status(400).json({ error: 'No shop associated with user' });
@@ -68,7 +73,11 @@ router.post('/integration', auth, async (req, res, next) => {
 });
 
 // Get delivery integrations
-router.get('/integrations', auth, async (req, res, next) => {
+router.get(
+  '/integrations',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
   try {
     if (!req.user.shopId) {
       return res.status(400).json({ error: 'No shop associated with user' });
@@ -97,7 +106,11 @@ router.get('/integrations', auth, async (req, res, next) => {
  *   "orderIds": ["<mongodb-id>", "..."]
  * }
  */
-router.post('/intigo/preview', auth, async (req, res, next) => {
+router.post(
+  '/intigo/preview',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
   try {
     if (!req.user.shopId) {
       return res.status(400).json({
@@ -155,7 +168,31 @@ router.post('/intigo/preview', auth, async (req, res, next) => {
 
     const ready = [];
     const review = [];
+    const duplicate = [];
     const invalid = [];
+
+    const existingShipments =
+      await DeliveryShipment.find({
+        orderId: {
+          $in: normalizedIds
+        },
+        provider: 'intigo'
+      })
+        .select({
+          orderId: 1,
+          correlationId: 1,
+          externalId: 1,
+          state: 1,
+          updatedAt: 1
+        })
+        .lean();
+
+    const shipmentByOrderId = new Map(
+      existingShipments.map(shipment => [
+        String(shipment.orderId),
+        shipment
+      ])
+    );
 
     for (const requestedId of normalizedIds) {
       const order = orderById.get(requestedId);
@@ -167,6 +204,28 @@ router.post('/intigo/preview', auth, async (req, res, next) => {
           errors: [
             'Commande introuvable ou hors de cette boutique'
           ]
+        });
+
+        continue;
+      }
+
+      const existingShipment =
+        shipmentByOrderId.get(requestedId);
+
+      if (
+        existingShipment &&
+        ['preparing', 'created'].includes(
+          existingShipment.state
+        )
+      ) {
+        duplicate.push({
+          orderId: requestedId,
+          confirmedId: order.confirmedId,
+          state: existingShipment.state,
+          correlationId:
+            existingShipment.correlationId || null,
+          externalId:
+            existingShipment.externalId || null
         });
 
         continue;
@@ -263,11 +322,13 @@ router.post('/intigo/preview', auth, async (req, res, next) => {
         selected: normalizedIds.length,
         ready: ready.length,
         review: review.length,
+        duplicate: duplicate.length,
         invalid: invalid.length
       },
 
       ready,
       review,
+      duplicate,
       invalid
     });
   } catch (error) {
