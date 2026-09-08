@@ -11,6 +11,7 @@ const {
   toPublicAnalysis,
   buildDryRunResult,
   reserveIntigoShipments,
+  isActivePreparingShipment,
   buildIntigoDispatchPreview,
   dispatchIntigoReservation
 } = require('../services/delivery/intigoShipmentService');
@@ -292,6 +293,152 @@ router.post(
           });
       }
 
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/delivery/intigo/reservations/:orderId
+ *
+ * Reprend une réservation LOCALE Intigo encore active.
+ *
+ * IMPORTANT :
+ * - lecture MongoDB uniquement
+ * - aucun appel Intigo
+ * - aucune mutation MongoDB
+ * - ne crée aucune nouvelle réservation
+ */
+router.get(
+  '/intigo/reservations/:orderId',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const ownership =
+        await verifyOrderOwnership(
+          req.params.orderId,
+          req.user
+        );
+
+      if (!ownership.valid) {
+        return res
+          .status(ownership.status)
+          .json({
+            error:
+              ownership.error
+          });
+      }
+
+      const shipment =
+        await DeliveryShipment.findOne({
+          orderId:
+            req.params.orderId,
+
+          shopId:
+            req.user.shopId,
+
+          provider:
+            'intigo'
+        })
+          .select({
+            state:
+              1,
+
+            externalId:
+              1,
+
+            correlationId:
+              1,
+
+            reservationId:
+              1,
+
+            reservedAt:
+              1,
+
+            reservationExpiresAt:
+              1
+          })
+          .lean();
+
+      if (
+        !shipment ||
+        !isActivePreparingShipment(
+          shipment
+        )
+      ) {
+        return res.status(409).json({
+          success:
+            false,
+
+          provider:
+            'intigo',
+
+          error:
+            'No active Intigo preparation exists for this order'
+        });
+      }
+
+      if (!shipment.reservationId) {
+        return res.status(409).json({
+          success:
+            false,
+
+          provider:
+            'intigo',
+
+          error:
+            'Active Intigo preparation has no reservation identifier'
+        });
+      }
+
+      return res.json({
+        success:
+          true,
+
+        provider:
+          'intigo',
+
+        orderId:
+          req.params.orderId,
+
+        state:
+          shipment.state,
+
+        correlationId:
+          shipment.correlationId ||
+          null,
+
+        reservationId:
+          shipment.reservationId,
+
+        reservedAt:
+          shipment.reservedAt ||
+          null,
+
+        reservationExpiresAt:
+          shipment.reservationExpiresAt ||
+          null,
+
+        externalId:
+          shipment.externalId ||
+          null,
+
+        remoteCallPerformed:
+          false,
+
+        databaseMutationPerformed:
+          false
+      });
+    } catch (error) {
       next(error);
     }
   }
