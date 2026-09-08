@@ -109,6 +109,51 @@ class IntigoClient {
     );
   }
 
+  async getParcel({
+    apiKey,
+    baseUrl = INTIGO_BASE_URL,
+    nid
+  }) {
+    const cleanBaseUrl =
+      String(
+        baseUrl ||
+        INTIGO_BASE_URL
+      ).replace(/\/+$/, '');
+
+    const cleanNid =
+      String(nid || '').trim();
+
+    if (!cleanNid) {
+      throw new Error(
+        'Intigo NID is required'
+      );
+    }
+
+    const response =
+      await axios.get(
+        `${cleanBaseUrl}/parcels/${encodeURIComponent(cleanNid)}`,
+        {
+          timeout: 10000,
+
+          headers: {
+            'X-API-Key':
+              apiKey,
+
+            Accept:
+              'application/json'
+          }
+        }
+      );
+
+    return {
+      status:
+        response.status,
+
+      data:
+        response.data
+    };
+  }
+
   async createParcelByName({
     apiKey,
     baseUrl = INTIGO_BASE_URL,

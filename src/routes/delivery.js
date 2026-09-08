@@ -14,6 +14,10 @@ const {
   dispatchIntigoReservation
 } = require('../services/delivery/intigoShipmentService');
 
+const {
+  getIntigoShipmentStatusPreview
+} = require('../services/delivery/intigoStatusService');
+
 // Helper to verify order belongs to user's shop
 const verifyOrderOwnership = async (orderId, user) => {
   const order = await Order.findById(orderId);
@@ -390,6 +394,63 @@ router.post(
                     null
                 }
               : {})
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/delivery/intigo/shipments/:orderId/status
+ *
+ * Lecture seule :
+ * - GET distant Intigo
+ * - aucun changement Order
+ * - aucun changement DeliveryShipment
+ * - retourne seulement le mapping proposé
+ */
+router.get(
+  '/intigo/shipments/:orderId/status',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const result =
+        await getIntigoShipmentStatusPreview({
+          shopId:
+            req.user.shopId,
+
+          orderId:
+            req.params.orderId
+        });
+
+      return res.json(
+        result
+      );
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(
+            error.statusCode
+          )
+          .json({
+            success:
+              false,
+
+            provider:
+              'intigo',
+
+            error:
+              error.message
           });
       }
 
