@@ -5,6 +5,9 @@ const Shop = require('../models/Shop');
 const Product = require('../models/Product');
 const Order = require('../models/Order');
 const { auth, authorize } = require('../middleware/auth');
+const { getRedisClient } = require('../config/redis');
+const logger = require('../utils/logger');
+const shopIntegrationService = require('../services/shopIntegrationService');
 
 const router = express.Router();
 
@@ -103,6 +106,172 @@ function verifyConvertyState(state) {
 
   return decoded;
 }
+
+// ------------------------------------------------------------
+// Converty webhook receiver
+//
+// Converty does not currently document a webhook signature.
+// The URL therefore contains a high-entropy per-shop key.
+//
+// IMPORTANT:
+// The inbound payload is NOT trusted as order data.
+// It is only used as a trigger. Confirmed fetches the real
+// orders again through the authenticated Converty API.
+// ------------------------------------------------------------
+
+router.post(
+  '/converty/webhook/:shopId/:secret',
+  async (req, res) => {
+    try {
+      const {
+        shopId,
+        secret
+      } = req.params;
+
+      if (
+        !/^[a-f0-9]{24}$/i.test(shopId) ||
+        !secret
+      ) {
+        return res.status(404).json({
+          success: false
+        });
+      }
+
+      const shop =
+        await Shop.findOne({
+          _id: shopId,
+          platform: 'converty',
+          isActive: true
+        })
+          .select(
+            '_id convertyCredentials.webhookSecret'
+          );
+
+      if (!shop) {
+        return res.status(404).json({
+          success: false
+        });
+      }
+
+      const expectedSecret =
+        shop.convertyCredentials?.webhookSecret ||
+        '';
+
+      const providedBuffer =
+        Buffer.from(String(secret));
+
+      const expectedBuffer =
+        Buffer.from(String(expectedSecret));
+
+      const secretValid =
+        expectedBuffer.length > 0 &&
+        providedBuffer.length === expectedBuffer.length &&
+        crypto.timingSafeEqual(
+          providedBuffer,
+          expectedBuffer
+        );
+
+      if (!secretValid) {
+        return res.status(401).json({
+          success: false
+        });
+      }
+
+      /*
+       * Avoid several Converty events launching the same
+       * API synchronization simultaneously.
+       */
+      const redis =
+        getRedisClient();
+
+      if (
+        redis &&
+        redis.isOpen &&
+        redis.isReady
+      ) {
+        const acquired =
+          await redis.set(
+            `confirmed:converty:webhook:${shopId}`,
+            '1',
+            {
+              NX: true,
+              EX: 15
+            }
+          );
+
+        if (!acquired) {
+          return res.status(200).json({
+            success: true
+          });
+        }
+      }
+
+      /*
+       * Acknowledge Converty immediately.
+       *
+       * The real synchronization runs afterwards.
+       * Polling remains the fallback if this async task fails.
+       */
+      res.status(200).json({
+        success: true
+      });
+
+      setImmediate(
+        async () => {
+          try {
+            const result =
+              await shopIntegrationService
+                .syncConvertyOrders(shopId);
+
+            logger.info(
+              'Converty webhook sync completed',
+              {
+                shopId,
+                fetched:
+                  result?.fetched || 0,
+                created:
+                  result?.created || 0,
+                skipped:
+                  result?.skipped || 0
+              }
+            );
+          } catch (error) {
+            logger.error(
+              'Converty webhook sync failed',
+              {
+                shopId,
+                message:
+                  error.message,
+                status:
+                  error.status ||
+                  error.response?.status ||
+                  null
+              }
+            );
+          }
+        }
+      );
+
+      return undefined;
+    } catch (error) {
+      logger.error(
+        'Converty webhook receiver failed',
+        {
+          message:
+            error.message
+        }
+      );
+
+      if (!res.headersSent) {
+        return res.status(500).json({
+          success: false
+        });
+      }
+
+      return undefined;
+    }
+  }
+);
 
 // ------------------------------------------------------------
 // Generate the Converty authorization URL

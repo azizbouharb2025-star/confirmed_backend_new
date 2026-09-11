@@ -158,9 +158,16 @@ app.use((req, res, next) => {
   
   res.on('finish', () => {
     const duration = Date.now() - start;
+
+    const safeRequestUrl =
+      req.originalUrl.replace(
+        /(\/api\/integration\/converty\/webhook\/[^/?]+\/)[^/?]+/i,
+        '$1[REDACTED]'
+      );
+
     const logData = {
       method: req.method,
-      url: req.originalUrl,
+      url: safeRequestUrl,
       status: res.statusCode,
       duration: `${duration}ms`,
       ip: req.ip || req.connection.remoteAddress,
