@@ -363,6 +363,8 @@ router.post(
                   result?.fetched || 0,
                 created:
                   result?.created || 0,
+                updated:
+                  result?.updated || 0,
                 skipped:
                   result?.skipped || 0
               }

@@ -382,6 +382,7 @@ class ShopIntegrationService {
 
     let fetched = 0;
     let created = 0;
+    let updated = 0;
     let skipped = 0;
 
     const toNumber = (value, fallback = 0) => {
@@ -570,16 +571,15 @@ class ShopIntegrationService {
           continue;
         }
 
-        const exists =
-          await Order.exists({
+        const existingOrder =
+          await Order.findOne({
             shopId,
             orderId
-          });
-
-        if (exists) {
-          skipped += 1;
-          continue;
-        }
+          })
+            .select(
+              '_id clientInfo items deliveryFee totalAmount'
+            )
+            .lean();
 
         const cart =
           Array.isArray(source.cart)
@@ -753,6 +753,220 @@ class ShopIntegrationService {
             calculatedTotal
           );
 
+        if (existingOrder) {
+          /*
+           * Update only data owned by Converty.
+           *
+           * Mongo subdocuments in items have internal _id values.
+           * Those IDs must never be used to decide whether the
+           * Converty order actually changed.
+           */
+          const syncedFields = {
+            items,
+            deliveryFee:
+              toNumber(
+                source?.total?.deliveryPrice,
+                0
+              ),
+            totalAmount
+          };
+
+          if (
+            source?.customer?.name !==
+              undefined &&
+            source?.customer?.name !==
+              null
+          ) {
+            syncedFields[
+              'clientInfo.name'
+            ] =
+              source.customer.name;
+          }
+
+          if (
+            source?.customer?.phone !==
+              undefined &&
+            source?.customer?.phone !==
+              null
+          ) {
+            syncedFields[
+              'clientInfo.phone'
+            ] =
+              source.customer.phone;
+          }
+
+          if (
+            source?.customer?.email !==
+              undefined &&
+            source?.customer?.email !==
+              null
+          ) {
+            syncedFields[
+              'clientInfo.email'
+            ] =
+              source.customer.email;
+          }
+
+          if (
+            source?.customer?.address !==
+              undefined &&
+            source?.customer?.address !==
+              null
+          ) {
+            syncedFields[
+              'clientInfo.address.street'
+            ] =
+              source.customer.address;
+          }
+
+          if (
+            source?.customer?.city !==
+              undefined &&
+            source?.customer?.city !==
+              null
+          ) {
+            syncedFields[
+              'clientInfo.address.city'
+            ] =
+              source.customer.city;
+          }
+
+          const normalizeItems =
+            value =>
+              (Array.isArray(value)
+                ? value
+                : []
+              ).map(item => ({
+                productId:
+                  item?.productId
+                    ? String(item.productId)
+                    : null,
+                name:
+                  item?.name || '',
+                quantity:
+                  toNumber(
+                    item?.quantity,
+                    1
+                  ),
+                price:
+                  toNumber(
+                    item?.price,
+                    0
+                  ),
+                sku:
+                  item?.sku || null,
+                url:
+                  item?.url || null
+              }));
+
+          const currentComparable = {
+            items:
+              normalizeItems(
+                existingOrder.items
+              ),
+
+            deliveryFee:
+              toNumber(
+                existingOrder.deliveryFee,
+                0
+              ),
+
+            totalAmount:
+              toNumber(
+                existingOrder.totalAmount,
+                0
+              ),
+
+            name:
+              existingOrder.clientInfo
+                ?.name || '',
+
+            phone:
+              existingOrder.clientInfo
+                ?.phone || '',
+
+            email:
+              existingOrder.clientInfo
+                ?.email || null,
+
+            street:
+              existingOrder.clientInfo
+                ?.address?.street || '',
+
+            city:
+              existingOrder.clientInfo
+                ?.address?.city || ''
+          };
+
+          const nextComparable = {
+            items:
+              normalizeItems(items),
+
+            deliveryFee:
+              syncedFields.deliveryFee,
+
+            totalAmount:
+              syncedFields.totalAmount,
+
+            name:
+              syncedFields[
+                'clientInfo.name'
+              ] ??
+              currentComparable.name,
+
+            phone:
+              syncedFields[
+                'clientInfo.phone'
+              ] ??
+              currentComparable.phone,
+
+            email:
+              syncedFields[
+                'clientInfo.email'
+              ] ??
+              currentComparable.email,
+
+            street:
+              syncedFields[
+                'clientInfo.address.street'
+              ] ??
+              currentComparable.street,
+
+            city:
+              syncedFields[
+                'clientInfo.address.city'
+              ] ??
+              currentComparable.city
+          };
+
+          const hasChanges =
+            JSON.stringify(
+              currentComparable
+            ) !==
+            JSON.stringify(
+              nextComparable
+            );
+
+          if (!hasChanges) {
+            skipped += 1;
+            continue;
+          }
+
+          await Order.updateOne(
+            {
+              _id:
+                existingOrder._id
+            },
+            {
+              $set:
+                syncedFields
+            }
+          );
+
+          updated += 1;
+          continue;
+        }
+
         const order =
           new Order({
             shopId,
@@ -848,12 +1062,14 @@ class ShopIntegrationService {
       `Converty sync ${shopId}: ` +
       `${fetched} fetched, ` +
       `${created} created, ` +
+      `${updated} updated, ` +
       `${skipped} skipped`
     );
 
     return {
       fetched,
       created,
+      updated,
       skipped
     };
   }

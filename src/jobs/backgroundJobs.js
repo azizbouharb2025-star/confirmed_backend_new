@@ -162,7 +162,7 @@ class BackgroundJobs {
 
     /*
      * Converty :
-     * seconde 15 toutes les minutes.
+     * seconde 15 toutes les 15 minutes.
      *
      * Le verrou distribué garantit qu'un seul
      * worker PM2 exécute la synchronisation.
@@ -171,7 +171,7 @@ class BackgroundJobs {
       process.env.CONVERTY_AUTO_SYNC_ENABLED === 'true'
     ) {
       cron.schedule(
-        '15 * * * * *',
+        '15 */15 * * * *',
         async () => {
           await executeScheduledJob({
             name:
