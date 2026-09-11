@@ -362,21 +362,14 @@ router.get(
         });
       }
 
-      return res
-        .status(200)
-        .send(`
-          <!doctype html>
-          <html>
-            <head>
-              <meta charset="utf-8">
-              <title>Confirmed + Converty</title>
-            </head>
-            <body style="font-family:Arial;padding:40px">
-              <h2>✅ Converty connecté à Confirmed</h2>
-              <p>Vous pouvez fermer cette fenêtre.</p>
-            </body>
-          </html>
-        `);
+      const frontendUrl =
+        (process.env.FRONTEND_URL || 'https://confirmed.tn')
+          .replace(/\/$/, '');
+
+      return res.redirect(
+        302,
+        `${frontendUrl}/panel/client/shops?converty=connected`
+      );
     } catch (error) {
       return res.status(400).json({
         error: 'Converty OAuth failed',

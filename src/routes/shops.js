@@ -59,12 +59,15 @@ router.post('/', auth, authorize('shop_owner'), async (req, res, next) => {
 
     const { platform } = req.body;
 
-    // Validate platform-specific credentials
-    const credentialField = `${platform}Credentials`;
-    if (!req.body[credentialField]) {
-      return res.status(400).json({ 
-        error: `${platform} credentials are required for this platform` 
-      });
+    // Converty uses OAuth, so no manual API credentials are required.
+    if (platform !== 'converty') {
+      const credentialField = `${platform}Credentials`;
+
+      if (!req.body[credentialField]) {
+        return res.status(400).json({
+          error: `${platform} credentials are required for this platform`
+        });
+      }
     }
 
     // Create default subscription for new shop
@@ -134,8 +137,8 @@ function getNextSteps(platform) {
       'Set up Instagram Shopping'
     ],
     converty: [
-      'Generate API credentials in Converty dashboard',
-      'Configure webhook endpoints',
+      'Connect Converty via OAuth',
+      'Authorize Confirmed',
       'Test order synchronization'
     ],
     tiktakpro: [
