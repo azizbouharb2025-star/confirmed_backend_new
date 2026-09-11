@@ -260,38 +260,154 @@ class ShopIntegrationService {
             : [];
 
         const items =
-          cart.map(entry => {
-            const product =
-              entry?.product || {};
+          await Promise.all(
+            cart.map(async entry => {
+              const product =
+                entry?.product || {};
 
-            return {
-              name:
-                product.name ||
-                'Produit Converty',
+              const externalProductId =
+                product?._id
+                  ? String(product._id)
+                  : null;
 
-              quantity:
-                Math.max(
-                  1,
-                  toNumber(
-                    entry?.quantity,
-                    1
-                  )
-                ),
+              const sku =
+                product?.sku ||
+                undefined;
 
-              price:
-                toNumber(
-                  entry?.pricePerUnit,
+              let catalogProduct = null;
+
+              if (externalProductId) {
+                catalogProduct =
+                  await Product.findOne({
+                    shopId,
+                    externalId:
+                      externalProductId
+                  });
+              }
+
+              if (
+                !catalogProduct &&
+                sku
+              ) {
+                catalogProduct =
+                  await Product.findOne({
+                    shopId,
+                    sku
+                  });
+              }
+
+              if (
+                !catalogProduct &&
+                product?.name
+              ) {
+                catalogProduct =
+                  new Product({
+                    shopId,
+
+                    externalId:
+                      externalProductId ||
+                      undefined,
+
+                    name:
+                      product.name,
+
+                    price:
+                      toNumber(
+                        product.price,
+                        toNumber(
+                          entry?.pricePerUnit,
+                          0
+                        )
+                      ),
+
+                    deliveryFee:
+                      toNumber(
+                        product.deliveryPrice,
+                        0
+                      ),
+
+                    sku,
+
+                    syncMethod:
+                      'auto_sync',
+
+                    lastSyncAt:
+                      new Date()
+                  });
+
+                await catalogProduct.save();
+              } else if (
+                catalogProduct &&
+                catalogProduct.syncMethod ===
+                  'auto_sync'
+              ) {
+                if (
+                  externalProductId &&
+                  !catalogProduct.externalId
+                ) {
+                  catalogProduct.externalId =
+                    externalProductId;
+                }
+
+                if (product?.name) {
+                  catalogProduct.name =
+                    product.name;
+                }
+
+                if (sku) {
+                  catalogProduct.sku =
+                    sku;
+                }
+
+                catalogProduct.price =
                   toNumber(
                     product.price,
-                    0
-                  )
-                ),
+                    toNumber(
+                      entry?.pricePerUnit,
+                      catalogProduct.price
+                    )
+                  );
 
-              sku:
-                product.sku ||
-                undefined
-            };
-          });
+                catalogProduct.lastSyncAt =
+                  new Date();
+
+                await catalogProduct.save();
+              }
+
+              return {
+                productId:
+                  catalogProduct?._id,
+
+                name:
+                  product.name ||
+                  'Produit Converty',
+
+                quantity:
+                  Math.max(
+                    1,
+                    toNumber(
+                      entry?.quantity,
+                      1
+                    )
+                  ),
+
+                price:
+                  toNumber(
+                    entry?.pricePerUnit,
+                    toNumber(
+                      product.price,
+                      0
+                    )
+                  ),
+
+                sku,
+
+                url:
+                  catalogProduct?.productLink ||
+                  undefined
+              };
+            })
+          );
 
         const calculatedTotal =
           items.reduce(
@@ -322,10 +438,37 @@ class ShopIntegrationService {
 
               phone:
                 source?.customer?.phone ||
-                ''
+                '',
+
+              email:
+                source?.customer?.email ||
+                undefined,
+
+              address:
+                (
+                  source?.customer?.address ||
+                  source?.customer?.city
+                )
+                  ? {
+                      street:
+                        source?.customer?.address ||
+                        '',
+
+                      city:
+                        source?.customer?.city ||
+                        ''
+                    }
+                  : undefined
             },
 
             items,
+
+            deliveryFee:
+              toNumber(
+                source?.total?.deliveryPrice,
+                0
+              ),
+
             totalAmount
           });
 
