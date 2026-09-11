@@ -17,6 +17,9 @@ const CONVERTY_AUTHORIZE_URL =
 const CONVERTY_TOKEN_URL =
   'https://partner.converty.shop/oauth2/token';
 
+const CONVERTY_API_BASE_URL =
+  'https://api.converty.shop/api/v1';
+
 const CONVERTY_SCOPES = [
   'read-hooks',
   'create-hooks',
@@ -105,6 +108,135 @@ function verifyConvertyState(state) {
   }
 
   return decoded;
+}
+
+async function ensureConvertyWebhookSubscriptions(
+  shop,
+  accessToken
+) {
+  let webhookSecret =
+    shop.convertyCredentials?.webhookSecret ||
+    '';
+
+  if (!webhookSecret) {
+    webhookSecret =
+      crypto.randomBytes(32).toString('hex');
+
+    await Shop.updateOne(
+      {
+        _id: shop._id
+      },
+      {
+        $set: {
+          'convertyCredentials.webhookSecret':
+            webhookSecret
+        }
+      }
+    );
+  }
+
+  /*
+   * Converty requires the webhook target to have the
+   * same origin as the registered OAuth redirect URI.
+   */
+  const {
+    redirectUri
+  } = getConvertyConfig();
+
+  const webhookOrigin =
+    new URL(redirectUri).origin;
+
+  const targetUrl =
+    `${webhookOrigin}` +
+    `/api/integration/converty/webhook/` +
+    `${shop._id}/${webhookSecret}`;
+
+  const events = [
+    'order.create',
+    'order.update'
+  ];
+
+  for (const event of events) {
+    try {
+      const response =
+        await axios.post(
+          `${CONVERTY_API_BASE_URL}/hooks/subscribe`,
+          {
+            targetUrl,
+            event
+          },
+          {
+            headers: {
+              Authorization:
+                `Bearer ${accessToken}`,
+              'Content-Type':
+                'application/json'
+            },
+            timeout: 15000,
+            validateStatus: () => true
+          }
+        );
+
+      if (response.status === 200) {
+        logger.info(
+          'Converty webhook automatically subscribed',
+          {
+            shopId:
+              String(shop._id),
+            event
+          }
+        );
+
+        continue;
+      }
+
+      /*
+       * Already registered is perfectly valid,
+       * especially after reconnecting OAuth.
+       */
+      if (response.status === 409) {
+        logger.info(
+          'Converty webhook already subscribed',
+          {
+            shopId:
+              String(shop._id),
+            event
+          }
+        );
+
+        continue;
+      }
+
+      logger.warn(
+        'Converty webhook automatic subscription failed',
+        {
+          shopId:
+            String(shop._id),
+          event,
+          status:
+            response.status,
+          message:
+            response.data?.message ||
+            null
+        }
+      );
+    } catch (error) {
+      /*
+       * Never fail OAuth because webhook setup failed.
+       * The one-minute poller remains the fallback.
+       */
+      logger.warn(
+        'Converty webhook automatic subscription failed',
+        {
+          shopId:
+            String(shop._id),
+          event,
+          message:
+            error.message
+        }
+      );
+    }
+  }
 }
 
 // ------------------------------------------------------------
@@ -530,6 +662,31 @@ router.get(
           error: 'Confirmed shop not found'
         });
       }
+
+      /*
+       * Do not delay or fail the OAuth redirect.
+       * Webhook registration runs asynchronously.
+       */
+      setImmediate(
+        async () => {
+          try {
+            await ensureConvertyWebhookSubscriptions(
+              shop,
+              accessToken
+            );
+          } catch (error) {
+            logger.warn(
+              'Converty webhook setup after OAuth failed',
+              {
+                shopId:
+                  String(shop._id),
+                message:
+                  error.message
+              }
+            );
+          }
+        }
+      );
 
       const frontendUrl =
         (process.env.FRONTEND_URL || 'https://confirmed.tn')

@@ -160,10 +160,19 @@ app.use((req, res, next) => {
     const duration = Date.now() - start;
 
     const safeRequestUrl =
-      req.originalUrl.replace(
-        /(\/api\/integration\/converty\/webhook\/[^/?]+\/)[^/?]+/i,
-        '$1[REDACTED]'
-      );
+      req.originalUrl
+        .replace(
+          /(\/api\/integration\/converty\/webhook\/[^/?]+\/)[^/?]+/i,
+          '$1[REDACTED]'
+        )
+        .replace(
+          /([?&]code=)[^&]+/gi,
+          '$1[REDACTED]'
+        )
+        .replace(
+          /([?&]state=)[^&]+/gi,
+          '$1[REDACTED]'
+        );
 
     const logData = {
       method: req.method,
