@@ -10,6 +10,12 @@ const queueService =
 const logger =
   require('../utils/logger');
 
+const Shop =
+  require('../models/Shop');
+
+const shopIntegrationService =
+  require('../services/shopIntegrationService');
+
 const {
   runScheduledJobOnce
 } = require(
@@ -153,6 +159,117 @@ class BackgroundJobs {
         });
       }
     );
+
+    /*
+     * Converty :
+     * seconde 15 toutes les 5 minutes.
+     *
+     * Le verrou distribué garantit qu'un seul
+     * worker PM2 exécute la synchronisation.
+     */
+    if (
+      process.env.CONVERTY_AUTO_SYNC_ENABLED === 'true'
+    ) {
+      cron.schedule(
+        '15 */5 * * * *',
+        async () => {
+          await executeScheduledJob({
+            name:
+              'converty-order-sync',
+
+            jobKey:
+              'confirmed:jobs:converty-order-sync',
+
+            windowMs:
+              5 * MINUTE,
+
+            lockTtlMs:
+              5 * MINUTE,
+
+            task:
+              async () => {
+                const shops =
+                  await Shop.find({
+                    platform:
+                      'converty',
+
+                    'convertyCredentials.accessToken': {
+                      $exists: true,
+                      $ne: ''
+                    }
+                  })
+                    .select(
+                      '_id name'
+                    )
+                    .lean();
+
+                const summary = {
+                  shops:
+                    shops.length,
+
+                  fetched:
+                    0,
+
+                  created:
+                    0,
+
+                  skipped:
+                    0,
+
+                  failed:
+                    0
+                };
+
+                for (const shop of shops) {
+                  try {
+                    const result =
+                      await shopIntegrationService
+                        .syncConvertyOrders(
+                          shop._id
+                        );
+
+                    summary.fetched +=
+                      result.fetched || 0;
+
+                    summary.created +=
+                      result.created || 0;
+
+                    summary.skipped +=
+                      result.skipped || 0;
+                  } catch (error) {
+                    summary.failed += 1;
+
+                    logger.error(
+                      'Converty shop sync failed',
+                      {
+                        shopId:
+                          String(shop._id),
+
+                        shopName:
+                          shop.name,
+
+                        message:
+                          error.message
+                      }
+                    );
+                  }
+                }
+
+                logger.info(
+                  'Converty automatic order sync completed',
+                  summary
+                );
+
+                return summary;
+              }
+          });
+        }
+      );
+    } else {
+      logger.info(
+        'Converty automatic order sync disabled'
+      );
+    }
 
     /*
      * Intigo :

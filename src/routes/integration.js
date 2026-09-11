@@ -1,9 +1,442 @@
 const express = require('express');
+const axios = require('axios');
+const crypto = require('crypto');
 const Shop = require('../models/Shop');
 const Product = require('../models/Product');
 const Order = require('../models/Order');
+const { auth, authorize } = require('../middleware/auth');
 
 const router = express.Router();
+
+const CONVERTY_AUTHORIZE_URL =
+  'https://partner.converty.shop/oauth2/authorize';
+
+const CONVERTY_TOKEN_URL =
+  'https://partner.converty.shop/oauth2/token';
+
+const CONVERTY_SCOPES = [
+  'read-hooks',
+  'create-hooks',
+  'delete-hooks',
+  'read-orders',
+  'read-stores'
+];
+
+function getConvertyConfig() {
+  const clientId = process.env.CONVERTY_CLIENT_ID;
+  const clientSecret = process.env.CONVERTY_CLIENT_SECRET;
+  const redirectUri = process.env.CONVERTY_REDIRECT_URI;
+
+  if (!clientId || !clientSecret || !redirectUri) {
+    throw new Error(
+      'Converty OAuth environment variables are missing'
+    );
+  }
+
+  return {
+    clientId,
+    clientSecret,
+    redirectUri
+  };
+}
+
+function createConvertyState(shopId) {
+  const { clientSecret } = getConvertyConfig();
+
+  const payload = Buffer
+    .from(
+      JSON.stringify({
+        shopId: String(shopId),
+        expiresAt: Date.now() + (10 * 60 * 1000)
+      })
+    )
+    .toString('base64url');
+
+  const signature = crypto
+    .createHmac('sha256', clientSecret)
+    .update(payload)
+    .digest('base64url');
+
+  return `${payload}.${signature}`;
+}
+
+function verifyConvertyState(state) {
+  const { clientSecret } = getConvertyConfig();
+
+  if (!state || !state.includes('.')) {
+    throw new Error('Invalid OAuth state');
+  }
+
+  const [payload, signature] = state.split('.');
+
+  const expected = crypto
+    .createHmac('sha256', clientSecret)
+    .update(payload)
+    .digest('base64url');
+
+  const expectedBuffer = Buffer.from(expected);
+  const signatureBuffer = Buffer.from(signature);
+
+  if (
+    expectedBuffer.length !== signatureBuffer.length ||
+    !crypto.timingSafeEqual(
+      expectedBuffer,
+      signatureBuffer
+    )
+  ) {
+    throw new Error('Invalid OAuth state signature');
+  }
+
+  const decoded = JSON.parse(
+    Buffer
+      .from(payload, 'base64url')
+      .toString('utf8')
+  );
+
+  if (
+    !decoded.shopId ||
+    !decoded.expiresAt ||
+    decoded.expiresAt < Date.now()
+  ) {
+    throw new Error('Expired OAuth state');
+  }
+
+  return decoded;
+}
+
+// ------------------------------------------------------------
+// Generate the Converty authorization URL
+// ------------------------------------------------------------
+
+router.get(
+  '/converty/oauth/start',
+  auth,
+  authorize('shop_owner', 'admin'),
+  async (req, res, next) => {
+    try {
+      const shopId =
+        req.user.role === 'admin' && req.query.shopId
+          ? req.query.shopId
+          : req.user.shopId;
+
+      if (!shopId) {
+        return res.status(400).json({
+          error: 'Shop is required'
+        });
+      }
+
+      const shop = await Shop
+        .findById(shopId)
+        .select('_id name platform');
+
+      if (!shop) {
+        return res.status(404).json({
+          error: 'Shop not found'
+        });
+      }
+
+      const {
+        clientId,
+        redirectUri
+      } = getConvertyConfig();
+
+      const state =
+        createConvertyState(shop._id);
+
+      const params =
+        new URLSearchParams({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          scope: CONVERTY_SCOPES.join(' '),
+          state
+        });
+
+      return res.json({
+        authorizationUrl:
+          `${CONVERTY_AUTHORIZE_URL}?${params.toString()}`
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// ------------------------------------------------------------
+// OAuth callback
+// ------------------------------------------------------------
+
+router.get(
+  '/converty/oauth/callback',
+  async (req, res) => {
+    try {
+      if (req.query.error) {
+        return res.status(400).json({
+          error: 'Converty authorization rejected',
+          detail: String(req.query.error)
+        });
+      }
+
+      const code =
+        typeof req.query.code === 'string'
+          ? req.query.code
+          : '';
+
+      const state =
+        typeof req.query.state === 'string'
+          ? req.query.state
+          : '';
+
+      if (!code || !state) {
+        return res.status(400).json({
+          error: 'Missing OAuth code or state'
+        });
+      }
+
+      const stateData =
+        verifyConvertyState(state);
+
+      const {
+        clientId,
+        clientSecret,
+        redirectUri
+      } = getConvertyConfig();
+
+      const form =
+        new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          client_id: clientId,
+          client_secret: clientSecret,
+          redirect_uri: redirectUri
+        });
+
+      const tokenResponse =
+        await axios.post(
+          CONVERTY_TOKEN_URL,
+          form.toString(),
+          {
+            headers: {
+              'Content-Type':
+                'application/x-www-form-urlencoded'
+            },
+            timeout: 15000,
+            validateStatus: () => true
+          }
+        );
+
+      if (
+        tokenResponse.status < 200 ||
+        tokenResponse.status >= 300
+      ) {
+        const detail =
+          tokenResponse.data?.message ||
+          tokenResponse.data?.error ||
+          'Token exchange failed';
+
+        return res.status(502).json({
+          error: 'Converty token exchange failed',
+          status: tokenResponse.status,
+          detail
+        });
+      }
+
+      const tokenData =
+        tokenResponse.data?.data ||
+        tokenResponse.data ||
+        {};
+
+      const accessToken =
+        tokenData.access_token ||
+        tokenData.accessToken ||
+        tokenData.token;
+
+      const refreshToken =
+        tokenData.refresh_token ||
+        tokenData.refreshToken ||
+        null;
+
+      if (!accessToken) {
+        return res.status(502).json({
+          error:
+            'Converty response did not contain an access token',
+          receivedFields:
+            Object.keys(tokenData)
+        });
+      }
+
+      const expiresIn =
+        Number(
+          tokenData.expires_in ||
+          tokenData.expiresIn ||
+          0
+        );
+
+      const rawStore =
+        tokenData.store ||
+        tokenData.store_id ||
+        tokenData.storeId ||
+        null;
+
+      const storeId =
+        rawStore &&
+        typeof rawStore === 'object'
+          ? (
+              rawStore._id ||
+              rawStore.id ||
+              null
+            )
+          : rawStore;
+
+      const rawScopes =
+        tokenData.grantedScopes ||
+        tokenData.granted_scopes ||
+        tokenData.scope ||
+        [];
+
+      const grantedScopes =
+        Array.isArray(rawScopes)
+          ? rawScopes
+          : typeof rawScopes === 'string'
+            ? rawScopes.split(/[ ,]+/).filter(Boolean)
+            : [];
+
+      const update = {
+        platform: 'converty',
+        'convertyCredentials.accessToken':
+          accessToken,
+        'convertyCredentials.connectedAt':
+          new Date()
+      };
+
+      if (refreshToken) {
+        update[
+          'convertyCredentials.refreshToken'
+        ] = refreshToken;
+      }
+
+      if (tokenData.token_type || tokenData.tokenType) {
+        update[
+          'convertyCredentials.tokenType'
+        ] =
+          tokenData.token_type ||
+          tokenData.tokenType;
+      }
+
+      if (storeId) {
+        update[
+          'convertyCredentials.storeId'
+        ] = String(storeId);
+      }
+
+      if (grantedScopes.length) {
+        update[
+          'convertyCredentials.grantedScopes'
+        ] = grantedScopes;
+      }
+
+      if (expiresIn > 0) {
+        update[
+          'convertyCredentials.expiresAt'
+        ] =
+          new Date(
+            Date.now() +
+            (expiresIn * 1000)
+          );
+      }
+
+      const shop =
+        await Shop.findByIdAndUpdate(
+          stateData.shopId,
+          {
+            $set: update
+          },
+          {
+            new: true
+          }
+        );
+
+      if (!shop) {
+        return res.status(404).json({
+          error: 'Confirmed shop not found'
+        });
+      }
+
+      return res
+        .status(200)
+        .send(`
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <title>Confirmed + Converty</title>
+            </head>
+            <body style="font-family:Arial;padding:40px">
+              <h2>✅ Converty connecté à Confirmed</h2>
+              <p>Vous pouvez fermer cette fenêtre.</p>
+            </body>
+          </html>
+        `);
+    } catch (error) {
+      return res.status(400).json({
+        error: 'Converty OAuth failed',
+        detail: error.message
+      });
+    }
+  }
+);
+
+// ------------------------------------------------------------
+// Connection status - never expose tokens
+// ------------------------------------------------------------
+
+router.get(
+  '/converty/status',
+  auth,
+  authorize('shop_owner', 'admin'),
+  async (req, res, next) => {
+    try {
+      const shopId =
+        req.user.role === 'admin' && req.query.shopId
+          ? req.query.shopId
+          : req.user.shopId;
+
+      const shop = await Shop
+        .findById(shopId)
+        .select(
+          'platform convertyCredentials.storeId ' +
+          'convertyCredentials.grantedScopes ' +
+          'convertyCredentials.expiresAt ' +
+          'convertyCredentials.connectedAt ' +
+          'convertyCredentials.accessToken'
+        );
+
+      if (!shop) {
+        return res.status(404).json({
+          error: 'Shop not found'
+        });
+      }
+
+      return res.json({
+        connected:
+          Boolean(
+            shop.convertyCredentials?.accessToken
+          ),
+        platform: shop.platform,
+        storeId:
+          shop.convertyCredentials?.storeId || null,
+        grantedScopes:
+          shop.convertyCredentials?.grantedScopes || [],
+        expiresAt:
+          shop.convertyCredentials?.expiresAt || null,
+        connectedAt:
+          shop.convertyCredentials?.connectedAt || null
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 // Middleware to authenticate API credentials
 const authenticateApiKey = async (req, res, next) => {

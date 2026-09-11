@@ -40,7 +40,14 @@ const shopSchema = new mongoose.Schema({
     apiKey: String,
     apiSecret: String,
     storeUrl: String,
-    webhookSecret: String
+    webhookSecret: String,
+    accessToken: String,
+    refreshToken: String,
+    tokenType: String,
+    storeId: String,
+    grantedScopes: [String],
+    expiresAt: Date,
+    connectedAt: Date
   },
   tiktakproCredentials: {
     apiKey: String,
