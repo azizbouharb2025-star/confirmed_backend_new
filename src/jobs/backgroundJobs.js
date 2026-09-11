@@ -193,6 +193,9 @@ class BackgroundJobs {
                     platform:
                       'converty',
 
+                    isActive:
+                      true,
+
                     'convertyCredentials.accessToken': {
                       $exists: true,
                       $ne: ''
@@ -217,7 +220,10 @@ class BackgroundJobs {
                     0,
 
                   failed:
-                    0
+                    0,
+
+                  rateLimited:
+                    false
                 };
 
                 for (const shop of shops) {
@@ -237,6 +243,29 @@ class BackgroundJobs {
                     summary.skipped +=
                       result.skipped || 0;
                   } catch (error) {
+                    if (
+                      error.code ===
+                        'CONVERTY_RATE_LIMIT' ||
+                      error.status === 429
+                    ) {
+                      summary.rateLimited =
+                        true;
+
+                      logger.warn(
+                        'Converty automatic sync stopped by rate limit',
+                        {
+                          shopId:
+                            String(shop._id),
+
+                          retryAfterSeconds:
+                            error.retryAfterSeconds ||
+                            null
+                        }
+                      );
+
+                      break;
+                    }
+
                     summary.failed += 1;
 
                     logger.error(

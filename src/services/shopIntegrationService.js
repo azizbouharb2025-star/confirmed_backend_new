@@ -6,6 +6,18 @@ const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
 const productService = require('./productService');
 
+const CONVERTY_TOKEN_URL =
+  'https://partner.converty.shop/oauth2/token';
+
+const CONVERTY_REFRESH_LEEWAY_MS =
+  5 * 60 * 1000;
+
+const CONVERTY_RATE_LIMIT_KEY =
+  'confirmed:converty:rate-limit-cooldown';
+
+const CONVERTY_RATE_LIMIT_FALLBACK_SECONDS =
+  15 * 60;
+
 class ShopIntegrationService {
   async syncOrders(shopId) {
     const targetShop = await Shop.findById(shopId);
@@ -158,6 +170,201 @@ class ShopIntegrationService {
     }
   }
 
+  async getConvertyAccessToken(shop) {
+    const credentials =
+      shop.convertyCredentials || {};
+
+    const accessToken =
+      credentials.accessToken;
+
+    const expiresAtMs =
+      credentials.expiresAt
+        ? new Date(credentials.expiresAt).getTime()
+        : null;
+
+    const expiresSoon =
+      Number.isFinite(expiresAtMs) &&
+      expiresAtMs <=
+        Date.now() +
+        CONVERTY_REFRESH_LEEWAY_MS;
+
+    if (
+      accessToken &&
+      !expiresSoon
+    ) {
+      return accessToken;
+    }
+
+    const refreshToken =
+      credentials.refreshToken;
+
+    if (!refreshToken) {
+      const error =
+        new Error(
+          'Converty reconnect required'
+        );
+
+      error.code =
+        'CONVERTY_RECONNECT_REQUIRED';
+
+      throw error;
+    }
+
+    const clientId =
+      process.env.CONVERTY_CLIENT_ID;
+
+    const clientSecret =
+      process.env.CONVERTY_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      throw new Error(
+        'Converty OAuth configuration missing'
+      );
+    }
+
+    const form =
+      new URLSearchParams({
+        grant_type:
+          'refresh_token',
+
+        refresh_token:
+          refreshToken,
+
+        client_id:
+          clientId,
+
+        client_secret:
+          clientSecret
+      });
+
+    const response =
+      await axios.post(
+        CONVERTY_TOKEN_URL,
+        form.toString(),
+        {
+          headers: {
+            'Content-Type':
+              'application/x-www-form-urlencoded'
+          },
+
+          timeout:
+            15000,
+
+          validateStatus:
+            () => true
+        }
+      );
+
+    if (
+      response.status < 200 ||
+      response.status >= 300
+    ) {
+      const error =
+        new Error(
+          'Converty token refresh failed'
+        );
+
+      error.code =
+        'CONVERTY_TOKEN_REFRESH_FAILED';
+
+      error.status =
+        response.status;
+
+      throw error;
+    }
+
+    const tokenData =
+      response.data?.data ||
+      response.data ||
+      {};
+
+    const nextAccessToken =
+      tokenData.access_token ||
+      tokenData.accessToken ||
+      tokenData.token;
+
+    if (!nextAccessToken) {
+      throw new Error(
+        'Converty refresh response has no access token'
+      );
+    }
+
+    const nextRefreshToken =
+      tokenData.refresh_token ||
+      tokenData.refreshToken ||
+      null;
+
+    const expiresIn =
+      Number(
+        tokenData.expires_in ||
+        tokenData.expiresIn ||
+        0
+      );
+
+    const setUpdate = {
+      'convertyCredentials.accessToken':
+        nextAccessToken
+    };
+
+    if (nextRefreshToken) {
+      setUpdate[
+        'convertyCredentials.refreshToken'
+      ] =
+        nextRefreshToken;
+    }
+
+    if (
+      tokenData.token_type ||
+      tokenData.tokenType
+    ) {
+      setUpdate[
+        'convertyCredentials.tokenType'
+      ] =
+        tokenData.token_type ||
+        tokenData.tokenType;
+    }
+
+    if (expiresIn > 0) {
+      setUpdate[
+        'convertyCredentials.expiresAt'
+      ] =
+        new Date(
+          Date.now() +
+          expiresIn * 1000
+        );
+    }
+
+    const update = {
+      $set:
+        setUpdate
+    };
+
+    if (!(expiresIn > 0)) {
+      update.$unset = {
+        'convertyCredentials.expiresAt':
+          1
+      };
+    }
+
+    await Shop.updateOne(
+      {
+        _id:
+          shop._id
+      },
+      update
+    );
+
+    logger.info(
+      'Converty OAuth token refreshed',
+      {
+        shopId:
+          String(shop._id)
+      }
+    );
+
+    return nextAccessToken;
+  }
+
   async syncConvertyOrders(shopId) {
     const shop = await Shop.findById(shopId);
 
@@ -166,13 +373,9 @@ class ShopIntegrationService {
     }
 
     const accessToken =
-      shop.convertyCredentials?.accessToken;
-
-    if (!accessToken) {
-      throw new Error(
-        `Converty access token missing for shop ${shopId}`
+      await this.getConvertyAccessToken(
+        shop
       );
-    }
 
     let page = 1;
     const limit = 50;
@@ -190,23 +393,147 @@ class ShopIntegrationService {
     };
 
     while (page <= 100) {
-      const response = await axios.get(
-        'https://api.converty.shop/api/v1/orders',
-        {
-          params: {
+      let response;
+
+      const redis =
+        getRedisClient();
+
+      if (
+        redis &&
+        redis.isOpen &&
+        redis.isReady
+      ) {
+        try {
+          const cooldownTtl =
+            await redis.ttl(
+              CONVERTY_RATE_LIMIT_KEY
+            );
+
+          if (cooldownTtl > 0) {
+            const cooldownError =
+              new Error(
+                'Converty rate limit cooldown active'
+              );
+
+            cooldownError.code =
+              'CONVERTY_RATE_LIMIT';
+
+            cooldownError.status =
+              429;
+
+            cooldownError.retryAfterSeconds =
+              cooldownTtl;
+
+            throw cooldownError;
+          }
+        } catch (error) {
+          if (
+            error.code ===
+            'CONVERTY_RATE_LIMIT'
+          ) {
+            throw error;
+          }
+
+          logger.warn(
+            `Unable to read Converty cooldown: ${error.message}`
+          );
+        }
+      }
+
+      try {
+        response = await axios.get(
+          'https://api.converty.shop/api/v1/orders',
+          {
+            params: {
               page,
               limit,
               status: 'pending'
             },
-          headers: {
-            Authorization:
-              `Bearer ${accessToken}`,
-            Accept:
-              'application/json'
-          },
-          timeout: 15000
+            headers: {
+              Authorization:
+                `Bearer ${accessToken}`,
+              Accept:
+                'application/json'
+            },
+            timeout: 15000
+          }
+        );
+      } catch (error) {
+        if (error.response?.status === 429) {
+          const rawRetryAfter =
+            error.response?.headers?.['retry-after'];
+
+          let retryAfter =
+            Number.parseInt(
+              rawRetryAfter,
+              10
+            );
+
+          if (
+            !Number.isFinite(retryAfter) &&
+            rawRetryAfter
+          ) {
+            const retryDate =
+              Date.parse(rawRetryAfter);
+
+            if (Number.isFinite(retryDate)) {
+              retryAfter =
+                Math.ceil(
+                  (retryDate - Date.now()) /
+                  1000
+                );
+            }
+          }
+
+          const cooldownSeconds =
+            Number.isFinite(retryAfter) &&
+            retryAfter > 0
+              ? retryAfter
+              : CONVERTY_RATE_LIMIT_FALLBACK_SECONDS;
+
+          const redis =
+            getRedisClient();
+
+          if (
+            redis &&
+            redis.isOpen &&
+            redis.isReady
+          ) {
+            try {
+              await redis.set(
+                CONVERTY_RATE_LIMIT_KEY,
+                '1',
+                {
+                  EX:
+                    cooldownSeconds
+                }
+              );
+            } catch (redisError) {
+              logger.warn(
+                `Unable to store Converty cooldown: ${redisError.message}`
+              );
+            }
+          }
+
+          const rateLimitError =
+            new Error(
+              'Converty rate limit reached'
+            );
+
+          rateLimitError.code =
+            'CONVERTY_RATE_LIMIT';
+
+          rateLimitError.status =
+            429;
+
+          rateLimitError.retryAfterSeconds =
+            cooldownSeconds;
+
+          throw rateLimitError;
         }
-      );
+
+        throw error;
+      }
 
       const root =
         response.data || {};

@@ -161,48 +161,115 @@ class QueueService {
   }
 
 
-  async assignNextOrder(operatorId) {
+  async assignNextOrder(operatorId, shopId = null) {
     try {
-      if (!this.redis) {
-        // Fallback: get oldest pending order
-        const order = await Order.findOneAndUpdate(
-          { status: 'pending', assignedOperatorId: null },
-          { assignedOperatorId: operatorId },
-          { new: true, sort: { createdAt: 1 } }
-        ).populate('shopId');
-        
-        if (order) {
-          logger.info(`Order ${order._id} assigned to operator ${operatorId}`);
-        }
-        return order;
+      let targetShopId = shopId;
+
+      if (!targetShopId) {
+        const operator = await User
+          .findById(operatorId)
+          .select('shopId')
+          .lean();
+
+        targetShopId = operator?.shopId;
       }
 
-      // Get next order from queue
-      const queueItem = await this.redis.rPop('call_queue');
-      if (!queueItem) return null;
+      if (!targetShopId) {
+        throw new Error(
+          `Operator ${operatorId} has no shop`
+        );
+      }
 
-      const { orderId } = JSON.parse(queueItem);
-      
-      // Assign order to operator
-      const order = await Order.findByIdAndUpdate(
-        orderId,
-        { assignedOperatorId: operatorId },
-        { new: true }
+      /*
+       * MongoDB is the source of truth.
+       * An operator can only receive an order
+       * from their own shop.
+       */
+      const order = await Order.findOneAndUpdate(
+        {
+          shopId: targetShopId,
+          status: 'pending',
+          assignedOperatorId: null
+        },
+        {
+          assignedOperatorId: operatorId
+        },
+        {
+          new: true,
+          sort: { createdAt: 1 }
+        }
       ).populate('shopId');
 
-      logger.info(`Order ${orderId} assigned to operator ${operatorId}`);
+      if (!order) {
+        return null;
+      }
+
+      /*
+       * Best-effort cleanup of the matching Redis item.
+       * Redis no longer controls shop isolation.
+       */
+      if (this.redis) {
+        try {
+          const queueItems =
+            await this.redis.lRange(
+              'call_queue',
+              0,
+              -1
+            );
+
+          const queueItem =
+            queueItems.find(item => {
+              try {
+                const parsed =
+                  JSON.parse(item);
+
+                return String(parsed.orderId) ===
+                  String(order._id);
+              } catch {
+                return false;
+              }
+            });
+
+          if (queueItem) {
+            await this.redis.lRem(
+              'call_queue',
+              1,
+              queueItem
+            );
+          }
+        } catch (redisError) {
+          logger.warn(
+            `Unable to clean Redis queue for order ${order._id}: ${redisError.message}`
+          );
+        }
+      }
+
+      logger.info(
+        `Order ${order._id} assigned to operator ${operatorId} for shop ${targetShopId}`
+      );
+
       return order;
     } catch (error) {
-      logger.error('Error assigning order:', error);
+      logger.error(
+        'Error assigning order:',
+        error
+      );
+
       throw error;
     }
   }
 
-  async getQueueLength() {
-    if (!this.redis) {
-      return await Order.countDocuments({ status: 'pending', assignedOperatorId: null });
+  async getQueueLength(shopId = null) {
+    const query = {
+      status: 'pending',
+      assignedOperatorId: null
+    };
+
+    if (shopId) {
+      query.shopId = shopId;
     }
-    return await this.redis.lLen('call_queue');
+
+    return await Order.countDocuments(query);
   }
 
   async getOperatorStats(operatorId) {
@@ -235,21 +302,49 @@ class QueueService {
       // Get available operators
       const operators = await User.find({
         role: 'operator',
-        isActive: true
+        isActive: true,
+        shopId: {
+          $exists: true,
+          $ne: null
+        }
+      }).populate({
+        path: 'shopId',
+        match: {
+          isActive: true
+        },
+        select: '_id isActive'
       });
 
       if (operators.length === 0) return;
 
       // Simple round-robin distribution
       for (const operator of operators) {
+        if (!operator.shopId) {
+          continue;
+        }
+
+        const operatorShopId =
+          operator.shopId._id ||
+          operator.shopId;
+
         const assignedCount = await Order.countDocuments({
+          shopId: operatorShopId,
           assignedOperatorId: operator._id,
-          status: { $in: ['pending', 'assigned', 'in_progress'] }
+          status: {
+            $in: [
+              'pending',
+              'assigned',
+              'in_progress'
+            ]
+          }
         });
 
         // Assign new order if operator has less than 5 pending orders
         if (assignedCount < 5) {
-          await this.assignNextOrder(operator._id);
+          await this.assignNextOrder(
+            operator._id,
+            operatorShopId
+          );
         }
       }
     } catch (error) {

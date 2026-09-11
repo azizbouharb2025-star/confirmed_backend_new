@@ -97,7 +97,10 @@ router.get(
 // Get next order for operator
 router.get('/next-order', auth, authorize('operator'), async (req, res, next) => {
   try {
-    const order = await queueService.assignNextOrder(req.user._id);
+    const order = await queueService.assignNextOrder(
+      req.user._id,
+      req.user.shopId
+    );
     
     if (!order) {
       return res.json({ message: 'No orders available' });
@@ -113,7 +116,9 @@ router.get('/next-order', auth, authorize('operator'), async (req, res, next) =>
 router.get('/stats', auth, authorize('operator'), async (req, res, next) => {
   try {
     const stats = await queueService.getOperatorStats(req.user._id);
-    const queueLength = await queueService.getQueueLength();
+    const queueLength = await queueService.getQueueLength(
+      req.user.shopId
+    );
     
     res.json({
       ...stats,
