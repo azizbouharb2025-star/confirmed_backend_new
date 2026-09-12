@@ -278,17 +278,28 @@ router.post('/shop/:shopId/sync', auth, async (req, res) => {
       return res.status(400).json({ error: 'Product sync is disabled for this shop' });
     }
     
+    let syncResult = null;
+
     if (shop.platform === 'shopify') {
       await productService.syncShopifyProducts(shopId);
     } else if (shop.platform === 'woocommerce') {
       await productService.syncWooCommerceProducts(shopId);
     } else if (shop.platform === 'meta') {
       await productService.syncMetaProducts(shopId);
+    } else if (shop.platform === 'converty') {
+      syncResult =
+        await productService
+          .syncConvertyProducts(shopId);
     } else {
       return res.status(400).json({ error: 'Auto-sync not supported for this platform' });
     }
     
-    res.json({ message: 'Products synced successfully' });
+    res.json({
+      message: 'Products synced successfully',
+      ...(syncResult
+        ? { result: syncResult }
+        : {})
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

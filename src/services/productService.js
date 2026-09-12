@@ -69,6 +69,344 @@ class ProductService {
     }
   }
 
+  async syncConvertyProducts(shopId) {
+    const shop = await Shop.findById(shopId);
+
+    if (!shop) {
+      throw new Error(`Shop not found: ${shopId}`);
+    }
+
+    if (shop.platform !== 'converty') {
+      throw new Error('Shop is not a Converty shop');
+    }
+
+    /*
+     * Lazy require avoids a module initialization cycle:
+     * shopIntegrationService already imports productService.
+     */
+    const shopIntegrationService =
+      require('./shopIntegrationService');
+
+    const accessToken =
+      await shopIntegrationService
+        .getConvertyAccessToken(shop);
+
+    let page = 1;
+    const limit = 50;
+
+    let fetched = 0;
+    let created = 0;
+    let updated = 0;
+    let skipped = 0;
+
+    const toNumber = (value, fallback = 0) => {
+      const parsed = Number(value);
+
+      return Number.isFinite(parsed)
+        ? parsed
+        : fallback;
+    };
+
+    while (page <= 100) {
+      const response = await axios.get(
+        'https://api.converty.shop/api/v1/products',
+        {
+          params: {
+            page,
+            limit
+          },
+          headers: {
+            Authorization:
+              `Bearer ${accessToken}`,
+            Accept:
+              'application/json'
+          },
+          timeout: 15000
+        }
+      );
+
+      const root = response.data || {};
+      const payload = root.data;
+
+      const products =
+        Array.isArray(payload)
+          ? payload
+          : payload?.products ||
+            payload?.items ||
+            payload?.docs ||
+            [];
+
+      if (!Array.isArray(products)) {
+        throw new Error(
+          'Unexpected Converty products response'
+        );
+      }
+
+      fetched += products.length;
+
+      for (const source of products) {
+        const externalId =
+          source?._id
+            ? String(source._id)
+            : source?.id
+              ? String(source.id)
+              : null;
+
+        if (
+          !externalId ||
+          !source?.name
+        ) {
+          skipped += 1;
+          continue;
+        }
+
+        const firstImage =
+          Array.isArray(source.images)
+            ? source.images[0]
+            : null;
+
+        const imageUrl =
+          typeof firstImage === 'string'
+            ? firstImage
+            : firstImage?.lg ||
+              firstImage?.md ||
+              firstImage?.sm ||
+              '';
+
+        const firstCategory =
+          Array.isArray(source.categories)
+            ? source.categories[0]
+            : null;
+
+        const category =
+          typeof firstCategory === 'string'
+            ? firstCategory
+            : firstCategory?.name ||
+              firstCategory?.title ||
+              firstCategory?.label ||
+              '';
+
+        const status =
+          String(
+            source.status || ''
+          ).toLowerCase();
+
+        const isActive =
+          source.isDeleted !== true &&
+          ![
+            'hidden',
+            'archived',
+            'deleted'
+          ].includes(status);
+
+        const inStock =
+          source.trackStock === true
+            ? toNumber(
+                source.stock,
+                0
+              ) > 0
+            : true;
+
+        const mapped = {
+          name:
+            source.name,
+
+          price:
+            toNumber(
+              source.price,
+              0
+            ),
+
+          deliveryFee:
+            toNumber(
+              source.deliveryPrice,
+              0
+            ),
+
+          sku:
+            source.sku ||
+            undefined,
+
+          description:
+            source.description ||
+            '',
+
+          imageUrl,
+
+          category,
+
+          inStock,
+
+          isActive,
+
+          syncMethod:
+            'auto_sync',
+
+          lastSyncAt:
+            new Date()
+        };
+
+        const existing =
+          await Product.findOne({
+            shopId,
+            externalId
+          })
+            .lean();
+
+        if (!existing) {
+          await new Product({
+            shopId,
+            externalId,
+            ...mapped
+          }).save();
+
+          created += 1;
+          continue;
+        }
+
+        const currentComparable = {
+          name:
+            existing.name || '',
+
+          price:
+            toNumber(
+              existing.price,
+              0
+            ),
+
+          deliveryFee:
+            toNumber(
+              existing.deliveryFee,
+              0
+            ),
+
+          sku:
+            existing.sku || null,
+
+          description:
+            existing.description || '',
+
+          imageUrl:
+            existing.imageUrl || '',
+
+          category:
+            existing.category || '',
+
+          inStock:
+            existing.inStock !== false,
+
+          isActive:
+            existing.isActive !== false,
+
+          syncMethod:
+            existing.syncMethod
+        };
+
+        const nextComparable = {
+          name:
+            mapped.name,
+
+          price:
+            mapped.price,
+
+          deliveryFee:
+            mapped.deliveryFee,
+
+          sku:
+            mapped.sku || null,
+
+          description:
+            mapped.description,
+
+          imageUrl:
+            mapped.imageUrl,
+
+          category:
+            mapped.category,
+
+          inStock:
+            mapped.inStock,
+
+          isActive:
+            mapped.isActive,
+
+          syncMethod:
+            'auto_sync'
+        };
+
+        const hasChanges =
+          JSON.stringify(
+            currentComparable
+          ) !==
+          JSON.stringify(
+            nextComparable
+          );
+
+        if (!hasChanges) {
+          await Product.updateOne(
+            {
+              _id:
+                existing._id
+            },
+            {
+              $set: {
+                lastSyncAt:
+                  new Date()
+              }
+            }
+          );
+
+          skipped += 1;
+          continue;
+        }
+
+        await Product.updateOne(
+          {
+            _id:
+              existing._id
+          },
+          {
+            $set:
+              mapped
+          }
+        );
+
+        updated += 1;
+      }
+
+      const total =
+        Number(root.count);
+
+      if (
+        products.length === 0 ||
+        products.length < limit ||
+        (
+          Number.isFinite(total) &&
+          fetched >= total
+        )
+      ) {
+        break;
+      }
+
+      page += 1;
+    }
+
+    logger.info(
+      `Converty product sync ${shopId}: ` +
+      `${fetched} fetched, ` +
+      `${created} created, ` +
+      `${updated} updated, ` +
+      `${skipped} skipped`
+    );
+
+    return {
+      fetched,
+      created,
+      updated,
+      skipped
+    };
+  }
+
   async addManualProduct(shopId, productData) {
     const product = new Product({
       shopId,

@@ -8,6 +8,7 @@ const { auth, authorize } = require('../middleware/auth');
 const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
 const shopIntegrationService = require('../services/shopIntegrationService');
+const productService = require('../services/productService');
 
 const router = express.Router();
 
@@ -25,6 +26,7 @@ const CONVERTY_SCOPES = [
   'create-hooks',
   'delete-hooks',
   'read-orders',
+  'read-products',
   'read-stores'
 ];
 
@@ -146,17 +148,39 @@ async function ensureConvertyWebhookSubscriptions(
   const webhookOrigin =
     new URL(redirectUri).origin;
 
-  const targetUrl =
+  const orderTargetUrl =
     `${webhookOrigin}` +
     `/api/integration/converty/webhook/` +
     `${shop._id}/${webhookSecret}`;
 
-  const events = [
-    'order.create',
-    'order.update'
+  const productTargetUrl =
+    `${webhookOrigin}` +
+    `/api/integration/converty/product-webhook/` +
+    `${shop._id}/${webhookSecret}`;
+
+  const subscriptions = [
+    {
+      event: 'order.create',
+      targetUrl: orderTargetUrl
+    },
+    {
+      event: 'order.update',
+      targetUrl: orderTargetUrl
+    },
+    {
+      event: 'product.create',
+      targetUrl: productTargetUrl
+    },
+    {
+      event: 'product.update',
+      targetUrl: productTargetUrl
+    }
   ];
 
-  for (const event of events) {
+  for (const {
+    event,
+    targetUrl
+  } of subscriptions) {
     try {
       const response =
         await axios.post(
@@ -390,6 +414,181 @@ router.post(
     } catch (error) {
       logger.error(
         'Converty webhook receiver failed',
+        {
+          message:
+            error.message
+        }
+      );
+
+      if (!res.headersSent) {
+        return res.status(500).json({
+          success: false
+        });
+      }
+
+      return undefined;
+    }
+  }
+);
+
+// ------------------------------------------------------------
+// Converty product webhook receiver
+//
+// The inbound payload is only a trigger.
+// Confirmed re-fetches the real catalogue through the
+// authenticated Converty Products API.
+// ------------------------------------------------------------
+
+router.post(
+  '/converty/product-webhook/:shopId/:secret',
+  async (req, res) => {
+    try {
+      const {
+        shopId,
+        secret
+      } = req.params;
+
+      if (
+        !/^[a-f0-9]{24}$/i.test(shopId) ||
+        !secret
+      ) {
+        return res.status(404).json({
+          success: false
+        });
+      }
+
+      const shop =
+        await Shop.findOne({
+          _id: shopId,
+          platform: 'converty',
+          isActive: true
+        })
+          .select(
+            '_id settings.productSyncEnabled ' +
+            'convertyCredentials.webhookSecret'
+          );
+
+      if (!shop) {
+        return res.status(404).json({
+          success: false
+        });
+      }
+
+      const expectedSecret =
+        shop.convertyCredentials?.webhookSecret ||
+        '';
+
+      const providedBuffer =
+        Buffer.from(String(secret));
+
+      const expectedBuffer =
+        Buffer.from(String(expectedSecret));
+
+      const secretValid =
+        expectedBuffer.length > 0 &&
+        providedBuffer.length ===
+          expectedBuffer.length &&
+        crypto.timingSafeEqual(
+          providedBuffer,
+          expectedBuffer
+        );
+
+      if (!secretValid) {
+        return res.status(401).json({
+          success: false
+        });
+      }
+
+      /*
+       * Product synchronization can be disabled from
+       * the Confirmed shop settings.
+       */
+      if (
+        shop.settings?.productSyncEnabled === false
+      ) {
+        return res.status(200).json({
+          success: true
+        });
+      }
+
+      /*
+       * Debounce product events independently from
+       * order events.
+       */
+      const redis =
+        getRedisClient();
+
+      if (
+        redis &&
+        redis.isOpen &&
+        redis.isReady
+      ) {
+        const acquired =
+          await redis.set(
+            `confirmed:converty:product-webhook:${shopId}`,
+            '1',
+            {
+              NX: true,
+              EX: 15
+            }
+          );
+
+        if (!acquired) {
+          return res.status(200).json({
+            success: true
+          });
+        }
+      }
+
+      /*
+       * Acknowledge Converty immediately.
+       */
+      res.status(200).json({
+        success: true
+      });
+
+      setImmediate(
+        async () => {
+          try {
+            const result =
+              await productService
+                .syncConvertyProducts(shopId);
+
+            logger.info(
+              'Converty product webhook sync completed',
+              {
+                shopId,
+                fetched:
+                  result?.fetched || 0,
+                created:
+                  result?.created || 0,
+                updated:
+                  result?.updated || 0,
+                skipped:
+                  result?.skipped || 0
+              }
+            );
+          } catch (error) {
+            logger.error(
+              'Converty product webhook sync failed',
+              {
+                shopId,
+                message:
+                  error.message,
+                status:
+                  error.status ||
+                  error.response?.status ||
+                  null
+              }
+            );
+          }
+        }
+      );
+
+      return undefined;
+    } catch (error) {
+      logger.error(
+        'Converty product webhook receiver failed',
         {
           message:
             error.message
@@ -686,6 +885,44 @@ router.get(
                   error.message
               }
             );
+          }
+
+          if (
+            shop.settings?.productSyncEnabled !== false
+          ) {
+            try {
+              const result =
+                await productService
+                  .syncConvertyProducts(
+                    String(shop._id)
+                  );
+
+              logger.info(
+                'Converty product sync after OAuth completed',
+                {
+                  shopId:
+                    String(shop._id),
+                  fetched:
+                    result?.fetched || 0,
+                  created:
+                    result?.created || 0,
+                  updated:
+                    result?.updated || 0,
+                  skipped:
+                    result?.skipped || 0
+                }
+              );
+            } catch (error) {
+              logger.warn(
+                'Converty product sync after OAuth failed',
+                {
+                  shopId:
+                    String(shop._id),
+                  message:
+                    error.message
+                }
+              );
+            }
           }
         }
       );
