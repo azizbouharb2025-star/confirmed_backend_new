@@ -25,7 +25,8 @@ const {
   analyzeColissimoOrders,
   reserveColissimoShipments,
   isActiveColissimoPreparingShipment,
-  buildColissimoDispatchPreview
+  buildColissimoDispatchPreview,
+  dispatchColissimoReservation
 } = require('../services/delivery/colissimoShipmentService');
 
 // Helper to verify order belongs to user's shop
@@ -546,6 +547,116 @@ router.post(
           .json({
             error:
               error.message
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+
+/**
+ * POST /api/delivery/colissimo/dispatch
+ *
+ * LIVE endpoint.
+ *
+ * Protections :
+ * - shop_owner
+ * - feature flag serveur
+ * - allowlist CID
+ * - exactement 1 colis
+ * - réservation non expirée
+ * - confirm=true
+ * - correlationId exact
+ * - hash SHA-256 exact
+ */
+router.post(
+  '/colissimo/dispatch',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const result =
+        await dispatchColissimoReservation({
+          shopId:
+            req.user.shopId,
+
+          reservationId:
+            req.body?.reservationId,
+
+          expectedCorrelationId:
+            req.body?.expectedCorrelationId,
+
+          expectedPayloadHash:
+            req.body?.expectedPayloadHash,
+
+          confirm:
+            req.body?.confirm
+        });
+
+      return res
+        .status(201)
+        .json(result);
+    } catch (error) {
+      if (
+        error.statusCode ||
+        error.remoteCreated
+      ) {
+        return res
+          .status(
+            error.statusCode ||
+            500
+          )
+          .json({
+            success:
+              false,
+
+            provider:
+              'colissimo',
+
+            error:
+              error.message,
+
+            ...(error.liveDispatchDisabled
+              ? {
+                  liveDispatchDisabled:
+                    true
+                }
+              : {}),
+
+            ...(error.liveDispatchNotAllowed
+              ? {
+                  liveDispatchNotAllowed:
+                    true
+                }
+              : {}),
+
+            ...(error.shipmentState
+              ? {
+                  shipmentState:
+                    error.shipmentState
+                }
+              : {}),
+
+            ...(error.remoteCreated
+              ? {
+                  remoteCreated:
+                    true,
+
+                  externalId:
+                    error.externalId ||
+                    null
+                }
+              : {})
           });
       }
 

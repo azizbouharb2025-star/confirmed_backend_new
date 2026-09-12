@@ -14,6 +14,9 @@ const {
   mapOrderToColissimo
 } = require('./colissimoMapper');
 
+const colissimoClient =
+  require('./colissimoClient');
+
 const makeError = (
   message,
   statusCode,
@@ -987,9 +990,814 @@ const buildColissimoDispatchPreview =
     };
   };
 
+
+const dispatchColissimoReservation =
+  async ({
+    shopId,
+    reservationId,
+    expectedCorrelationId,
+    expectedPayloadHash,
+    confirm
+  }) => {
+    /*
+     * VERROU PRINCIPAL.
+     * Aucun appel distant si false.
+     */
+    if (
+      process.env.COLISSIMO_LIVE_DISPATCH_ENABLED !==
+      'true'
+    ) {
+      const error =
+        new Error(
+          'Live Colissimo dispatch is disabled'
+        );
+
+      error.statusCode = 409;
+      error.liveDispatchDisabled = true;
+
+      throw error;
+    }
+
+    if (confirm !== true) {
+      throw makeError(
+        'Explicit confirmation is required',
+        400
+      );
+    }
+
+    const cleanReservationId =
+      String(
+        reservationId || ''
+      ).trim();
+
+    const cleanExpectedCid =
+      String(
+        expectedCorrelationId || ''
+      ).trim();
+
+    const cleanExpectedHash =
+      String(
+        expectedPayloadHash || ''
+      ).trim();
+
+    if (!cleanReservationId) {
+      throw makeError(
+        'reservationId is required',
+        400
+      );
+    }
+
+    if (!cleanExpectedCid) {
+      throw makeError(
+        'expectedCorrelationId is required',
+        400
+      );
+    }
+
+    if (
+      !/^[a-f0-9]{64}$/i.test(
+        cleanExpectedHash
+      )
+    ) {
+      throw makeError(
+        'expectedPayloadHash must be a SHA-256 hash',
+        400
+      );
+    }
+
+    /*
+     * Première version LIVE :
+     * exactement UN colis.
+     */
+    const shipments =
+      await DeliveryShipment.find({
+        shopId,
+        provider:
+          'colissimo',
+        reservationId:
+          cleanReservationId
+      })
+        .lean();
+
+    if (
+      shipments.length !== 1
+    ) {
+      throw makeError(
+        'Live Colissimo dispatch requires exactly one reserved shipment',
+        409
+      );
+    }
+
+    const shipment =
+      shipments[0];
+
+    if (
+      shipment.state !==
+      'preparing'
+    ) {
+      throw makeError(
+        `Shipment is not preparing (${shipment.state})`,
+        409
+      );
+    }
+
+    if (
+      !shipment.reservationExpiresAt ||
+      new Date(
+        shipment.reservationExpiresAt
+      ).getTime() <= Date.now()
+    ) {
+      throw makeError(
+        'Colissimo reservation has expired',
+        409
+      );
+    }
+
+    if (
+      shipment.correlationId !==
+      cleanExpectedCid
+    ) {
+      throw makeError(
+        'Correlation ID confirmation mismatch',
+        409
+      );
+    }
+
+    const order =
+      await Order.findOne({
+        _id:
+          shipment.orderId,
+        shopId
+      })
+        .lean();
+
+    if (!order) {
+      throw makeError(
+        'Order not found for shipment',
+        404
+      );
+    }
+
+    const integration =
+      await DeliveryIntegration.findOne({
+        shopId,
+        platform:
+          'colissimo',
+        isActive:
+          true
+      })
+        .lean();
+
+    const addToken =
+      String(
+        integration
+          ?.credentials
+          ?.addToken ||
+        ''
+      ).trim();
+
+    const baseUrl =
+      String(
+        integration
+          ?.credentials
+          ?.baseUrl ||
+        'https://colissimodelivery.tn/api/v1/post.php'
+      ).trim();
+
+    if (!addToken) {
+      throw makeError(
+        'Colissimo integration is not ready',
+        409
+      );
+    }
+
+    const metadata =
+      shipment.metadata ||
+      {};
+
+    const mapped =
+      mapOrderToColissimo(
+        order,
+        {
+          typeColis:
+            metadata.typeColis,
+
+          ouvrir:
+            Boolean(
+              metadata.ouvrir
+            ),
+
+          fragile:
+            Boolean(
+              metadata.fragile
+            )
+        }
+      );
+
+    if (
+      mapped.errors.length >
+      0
+    ) {
+      throw makeError(
+        mapped.errors.join(
+          ' | '
+        ),
+        400
+      );
+    }
+
+    const actualPayloadHash =
+      crypto
+        .createHash(
+          'sha256'
+        )
+        .update(
+          JSON.stringify(
+            mapped.payload
+          )
+        )
+        .digest(
+          'hex'
+        );
+
+    if (
+      actualPayloadHash !==
+      cleanExpectedHash
+    ) {
+      const error =
+        makeError(
+          'Payload changed after dispatch preview',
+          409
+        );
+
+      error.actualPayloadHash =
+        actualPayloadHash;
+
+      throw error;
+    }
+
+    /*
+     * SECOND VERROU LIVE :
+     * allowlist explicite.
+     *
+     * Fail closed :
+     * vide = aucun colis autorisé.
+     */
+    const allowedLiveCids =
+      String(
+        process.env
+          .COLISSIMO_LIVE_ALLOWED_CIDS ||
+        ''
+      )
+        .split(',')
+        .map(value =>
+          value.trim()
+        )
+        .filter(Boolean);
+
+    if (
+      allowedLiveCids.length === 0 ||
+      !allowedLiveCids.includes(
+        cleanExpectedCid
+      )
+    ) {
+      const error =
+        new Error(
+          'Live Colissimo dispatch is not allowed for this order'
+        );
+
+      error.statusCode = 403;
+      error.liveDispatchNotAllowed =
+        true;
+
+      throw error;
+    }
+
+    /*
+     * VERROU DURABLE AVANT LE POST.
+     */
+    const dispatchStartedAt =
+      new Date();
+
+    const dispatchingShipment =
+      await DeliveryShipment.findOneAndUpdate(
+        {
+          _id:
+            shipment._id,
+
+          shopId,
+
+          provider:
+            'colissimo',
+
+          state:
+            'preparing',
+
+          reservationId:
+            cleanReservationId,
+
+          reservationExpiresAt: {
+            $gt:
+              dispatchStartedAt
+          }
+        },
+
+        {
+          $set: {
+            state:
+              'dispatching',
+
+            dispatchStartedAt,
+
+            payloadHash:
+              actualPayloadHash
+          }
+        },
+
+        {
+          new:
+            true
+        }
+      );
+
+    if (!dispatchingShipment) {
+      throw makeError(
+        'Shipment dispatch lock could not be acquired',
+        409
+      );
+    }
+
+    /*
+     * À PARTIR D'ICI :
+     * un POST Colissimo peut réellement avoir commencé.
+     */
+    let remoteResult;
+
+    try {
+      remoteResult =
+        await colissimoClient
+          .createShipment({
+            token:
+              addToken,
+
+            baseUrl,
+
+            payload:
+              mapped.payload
+          });
+    } catch (error) {
+      const remoteStatus =
+        error.response
+          ?.status;
+
+      /*
+       * 4xx = rejet certain.
+       *
+       * Timeout / réseau / 5xx :
+       * impossible de savoir avec certitude si
+       * Colissimo a créé le colis.
+       */
+      const definitiveFailure =
+        Number.isInteger(
+          remoteStatus
+        ) &&
+        remoteStatus >= 400 &&
+        remoteStatus < 500;
+
+      const nextState =
+        definitiveFailure
+          ? 'failed'
+          : 'reconcile_required';
+
+      await DeliveryShipment.updateOne(
+        {
+          _id:
+            shipment._id,
+
+          state:
+            'dispatching',
+
+          reservationId:
+            cleanReservationId
+        },
+
+        {
+          $set: {
+            state:
+              nextState,
+
+            lastError: {
+              message:
+                error.response
+                  ?.data
+                  ?.message ||
+                error.message,
+
+              code:
+                remoteStatus ||
+                null,
+
+              at:
+                new Date()
+            }
+          },
+
+          $unset: {
+            reservationId:
+              1,
+
+            reservedAt:
+              1,
+
+            reservationExpiresAt:
+              1
+          }
+        }
+      );
+
+      const dispatchError =
+        new Error(
+          definitiveFailure
+            ? 'Colissimo rejected shipment creation'
+            : 'Colissimo result is uncertain; reconciliation required'
+        );
+
+      dispatchError.statusCode =
+        definitiveFailure
+          ? remoteStatus
+          : 502;
+
+      dispatchError.shipmentState =
+        nextState;
+
+      throw dispatchError;
+    }
+
+    const responseData =
+      remoteResult
+        ?.data || {};
+
+    const success =
+      responseData.status === 1 ||
+      responseData.status === '1';
+
+    const externalId =
+      String(
+        responseData
+          .status_message ||
+        ''
+      ).trim();
+
+    /*
+     * Une réponse reçue avec status != 1
+     * est un rejet applicatif certain.
+     */
+    if (!success) {
+      await DeliveryShipment.updateOne(
+        {
+          _id:
+            shipment._id,
+
+          state:
+            'dispatching',
+
+          reservationId:
+            cleanReservationId
+        },
+
+        {
+          $set: {
+            state:
+              'failed',
+
+            lastError: {
+              message:
+                String(
+                  responseData
+                    .status_message ||
+                  'Colissimo creation rejected'
+                ),
+
+              code:
+                responseData.status ??
+                remoteResult?.status ??
+                null,
+
+              at:
+                new Date()
+            }
+          },
+
+          $unset: {
+            reservationId:
+              1,
+
+            reservedAt:
+              1,
+
+            reservationExpiresAt:
+              1
+          }
+        }
+      );
+
+      const error =
+        new Error(
+          'Colissimo rejected shipment creation'
+        );
+
+      error.statusCode = 400;
+      error.shipmentState =
+        'failed';
+
+      throw error;
+    }
+
+    /*
+     * status=1 mais sans code-barres :
+     * réponse incohérente.
+     * On ne retry surtout pas automatiquement.
+     */
+    if (!externalId) {
+      await DeliveryShipment.updateOne(
+        {
+          _id:
+            shipment._id,
+
+          state:
+            'dispatching',
+
+          reservationId:
+            cleanReservationId
+        },
+
+        {
+          $set: {
+            state:
+              'reconcile_required',
+
+            lastError: {
+              message:
+                'Colissimo returned success without tracking code',
+
+              code:
+                remoteResult?.status ||
+                null,
+
+              at:
+                new Date()
+            }
+          },
+
+          $unset: {
+            reservationId:
+              1,
+
+            reservedAt:
+              1,
+
+            reservationExpiresAt:
+              1
+          }
+        }
+      );
+
+      const error =
+        new Error(
+          'Unexpected Colissimo response; reconciliation required'
+        );
+
+      error.statusCode = 502;
+      error.shipmentState =
+        'reconcile_required';
+
+      throw error;
+    }
+
+    const standardLabelUrl =
+      String(
+        responseData.lien ||
+        ''
+      ).trim();
+
+    const zebraLabelUrl =
+      String(
+        responseData
+          .lien_zebra ||
+        ''
+      ).trim();
+
+    /*
+     * Succès transporteur confirmé.
+     */
+    const createdShipment =
+      await DeliveryShipment.findOneAndUpdate(
+        {
+          _id:
+            shipment._id,
+
+          shopId,
+
+          provider:
+            'colissimo',
+
+          state:
+            'dispatching',
+
+          reservationId:
+            cleanReservationId,
+
+          payloadHash:
+            actualPayloadHash
+        },
+
+        {
+          $set: {
+            state:
+              'created',
+
+            externalId,
+
+            providerStatusCode:
+              responseData.status,
+
+            providerStatusLabel:
+              'created',
+
+            metadata: {
+              ...metadata,
+
+              labelUrl:
+                standardLabelUrl ||
+                null,
+
+              zebraLabelUrl:
+                zebraLabelUrl ||
+                null
+            }
+          },
+
+          $unset: {
+            reservationId:
+              1,
+
+            reservedAt:
+              1,
+
+            reservationExpiresAt:
+              1,
+
+            lastError:
+              1
+          }
+        },
+
+        {
+          new:
+            true
+        }
+      );
+
+    if (!createdShipment) {
+      /*
+       * Le colis existe déjà chez Colissimo,
+       * mais notre finalisation locale a échoué.
+       * Ne jamais retry automatiquement.
+       */
+      await DeliveryShipment.updateOne(
+        {
+          _id:
+            shipment._id
+        },
+
+        {
+          $set: {
+            state:
+              'reconcile_required',
+
+            externalId,
+
+            lastError: {
+              message:
+                'Remote Colissimo shipment created but local finalization failed',
+
+              code:
+                null,
+
+              at:
+                new Date()
+            }
+          },
+
+          $unset: {
+            reservationId:
+              1,
+
+            reservedAt:
+              1,
+
+            reservationExpiresAt:
+              1
+          }
+        }
+      );
+
+      const error =
+        new Error(
+          'Colissimo shipment was created but local reconciliation is required'
+        );
+
+      error.statusCode = 500;
+      error.remoteCreated = true;
+      error.externalId =
+        externalId;
+      error.shipmentState =
+        'reconcile_required';
+
+      throw error;
+    }
+
+    /*
+     * Synchronisation pratique de la commande.
+     * Le shipment reste la source de vérité transporteur.
+     */
+    let orderSyncWarning =
+      null;
+
+    try {
+      await Order.updateOne(
+        {
+          _id:
+            order._id,
+          shopId
+        },
+
+        {
+          $set: {
+            'deliveryInfo.trackingNumber':
+              externalId,
+
+            'deliveryInfo.carrier':
+              'Colissimo'
+          }
+        }
+      );
+    } catch (error) {
+      orderSyncWarning =
+        'Shipment created, but order deliveryInfo could not be synchronized';
+    }
+
+    return {
+      success:
+        true,
+
+      provider:
+        'colissimo',
+
+      remoteCallPerformed:
+        true,
+
+      shipmentId:
+        String(
+          createdShipment._id
+        ),
+
+      orderId:
+        String(order._id),
+
+      confirmedId:
+        order.confirmedId,
+
+      correlationId:
+        cleanExpectedCid,
+
+      state:
+        createdShipment.state,
+
+      externalId,
+
+      trackingNumber:
+        externalId,
+
+      labelUrl:
+        standardLabelUrl ||
+        null,
+
+      zebraLabelUrl:
+        zebraLabelUrl ||
+        null,
+
+      payloadHash:
+        actualPayloadHash,
+
+      orderSyncWarning
+    };
+  };
+
 module.exports = {
   analyzeColissimoOrders,
   reserveColissimoShipments,
   isActiveColissimoPreparingShipment,
-  buildColissimoDispatchPreview
+  buildColissimoDispatchPreview,
+  dispatchColissimoReservation
 };
