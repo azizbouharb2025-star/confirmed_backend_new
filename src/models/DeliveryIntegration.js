@@ -8,7 +8,7 @@ const deliveryIntegrationSchema = new mongoose.Schema({
   },
   platform: {
     type: String,
-    enum: ['aramex', 'intigo', 'dhl', 'fedex', 'local_courier', 'custom'],
+    enum: ['aramex', 'intigo', 'colissimo', 'dhl', 'fedex', 'local_courier', 'custom'],
     required: true
   },
   credentials: {
@@ -17,6 +17,8 @@ const deliveryIntegrationSchema = new mongoose.Schema({
     username: String,
     password: String,
     accountNumber: String,
+    addToken: String,
+    trackingToken: String,
     baseUrl: String
   },
   settings: {

@@ -21,6 +21,13 @@ const {
   syncIntigoShipmentStatus
 } = require('../services/delivery/intigoStatusService');
 
+const {
+  analyzeColissimoOrders,
+  reserveColissimoShipments,
+  isActiveColissimoPreparingShipment,
+  buildColissimoDispatchPreview
+} = require('../services/delivery/colissimoShipmentService');
+
 // Helper to verify order belongs to user's shop
 const verifyOrderOwnership = async (orderId, user) => {
   const order = await Order.findById(orderId);
@@ -51,7 +58,9 @@ const serializeIntegration = integration => {
       credentials.apiSecret ||
       credentials.username ||
       credentials.password ||
-      credentials.accountNumber
+      credentials.accountNumber ||
+      credentials.addToken ||
+      credentials.trackingToken
     ),
     createdAt: value.createdAt,
     updatedAt: value.updatedAt
@@ -106,6 +115,445 @@ router.get(
     next(error);
   }
 });
+
+
+/**
+ * GET /api/delivery/colissimo/capabilities
+ *
+ * Aucun appel distant.
+ */
+router.get(
+  '/colissimo/capabilities',
+  auth,
+  authorize('shop_owner'),
+  async (req, res) => {
+    if (!req.user.shopId) {
+      return res.status(400).json({
+        error:
+          'No shop associated with user'
+      });
+    }
+
+    return res.json({
+      success: true,
+      provider: 'colissimo',
+
+      liveDispatchEnabled:
+        process.env.COLISSIMO_LIVE_DISPATCH_ENABLED ===
+        'true',
+
+      requiresExplicitConfirmation:
+        true,
+
+      maxLiveOrdersPerDispatch:
+        1,
+
+      trackingImplemented:
+        false,
+
+      remoteCallPerformed:
+        false
+    });
+  }
+);
+
+/**
+ * POST /api/delivery/colissimo/preview
+ *
+ * Validation locale uniquement.
+ * Aucun colis Colissimo n'est créé.
+ */
+router.post(
+  '/colissimo/preview',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const {
+        orderIds,
+        typeColis,
+        ouvrir = false,
+        fragile = false
+      } = req.body || {};
+
+      if (
+        typeof ouvrir !==
+        'boolean'
+      ) {
+        return res.status(400).json({
+          error:
+            'ouvrir must be a boolean'
+        });
+      }
+
+      if (
+        typeof fragile !==
+        'boolean'
+      ) {
+        return res.status(400).json({
+          error:
+            'fragile must be a boolean'
+        });
+      }
+
+      const result =
+        await analyzeColissimoOrders({
+          shopId:
+            req.user.shopId,
+
+          orderIds,
+          typeColis,
+          ouvrir,
+          fragile
+        });
+
+      return res.json({
+        success: true,
+        provider: 'colissimo',
+        ...result
+      });
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(error.statusCode)
+          .json({
+            error:
+              error.message,
+
+            ...(error.invalidOrderIds
+              ? {
+                  invalidOrderIds:
+                    error.invalidOrderIds
+                }
+              : {})
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * POST /api/delivery/colissimo/reservations
+ *
+ * Réservation MongoDB uniquement.
+ * Aucun appel vers colissimodelivery.tn.
+ */
+router.post(
+  '/colissimo/reservations',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const {
+        orderIds,
+        typeColis,
+        ouvrir = false,
+        fragile = false,
+        allowReview = false
+      } = req.body || {};
+
+      if (
+        typeof ouvrir !==
+        'boolean'
+      ) {
+        return res.status(400).json({
+          error:
+            'ouvrir must be a boolean'
+        });
+      }
+
+      if (
+        typeof fragile !==
+        'boolean'
+      ) {
+        return res.status(400).json({
+          error:
+            'fragile must be a boolean'
+        });
+      }
+
+      if (
+        typeof allowReview !==
+        'boolean'
+      ) {
+        return res.status(400).json({
+          error:
+            'allowReview must be a boolean'
+        });
+      }
+
+      const analysis =
+        await analyzeColissimoOrders({
+          shopId:
+            req.user.shopId,
+
+          orderIds,
+          typeColis,
+          ouvrir,
+          fragile
+        });
+
+      const result =
+        await reserveColissimoShipments({
+          shopId:
+            req.user.shopId,
+
+          userId:
+            req.user._id,
+
+          analysis,
+
+          typeColis,
+          ouvrir,
+          fragile,
+          allowReview
+        });
+
+      return res.json(
+        result
+      );
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(error.statusCode)
+          .json({
+            error:
+              error.message,
+
+            ...(error.invalidOrderIds
+              ? {
+                  invalidOrderIds:
+                    error.invalidOrderIds
+                }
+              : {})
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * GET /api/delivery/colissimo/reservations/:orderId
+ *
+ * Reprend une préparation locale active.
+ * Lecture MongoDB uniquement.
+ */
+router.get(
+  '/colissimo/reservations/:orderId',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const ownership =
+        await verifyOrderOwnership(
+          req.params.orderId,
+          req.user
+        );
+
+      if (!ownership.valid) {
+        return res
+          .status(ownership.status)
+          .json({
+            error:
+              ownership.error
+          });
+      }
+
+      const shipment =
+        await DeliveryShipment.findOne({
+          orderId:
+            req.params.orderId,
+
+          shopId:
+            req.user.shopId,
+
+          provider:
+            'colissimo'
+        })
+          .select({
+            state:
+              1,
+
+            externalId:
+              1,
+
+            correlationId:
+              1,
+
+            reservationId:
+              1,
+
+            reservedAt:
+              1,
+
+            reservationExpiresAt:
+              1,
+
+            metadata:
+              1
+          })
+          .lean();
+
+      if (
+        !shipment ||
+        !isActiveColissimoPreparingShipment(
+          shipment
+        )
+      ) {
+        return res.status(409).json({
+          success:
+            false,
+
+          provider:
+            'colissimo',
+
+          error:
+            'No active Colissimo preparation exists for this order'
+        });
+      }
+
+      if (!shipment.reservationId) {
+        return res.status(409).json({
+          success:
+            false,
+
+          provider:
+            'colissimo',
+
+          error:
+            'Active Colissimo preparation has no reservation identifier'
+        });
+      }
+
+      return res.json({
+        success:
+          true,
+
+        provider:
+          'colissimo',
+
+        orderId:
+          req.params.orderId,
+
+        state:
+          shipment.state,
+
+        correlationId:
+          shipment.correlationId ||
+          null,
+
+        reservationId:
+          shipment.reservationId,
+
+        reservedAt:
+          shipment.reservedAt ||
+          null,
+
+        reservationExpiresAt:
+          shipment.reservationExpiresAt ||
+          null,
+
+        metadata:
+          shipment.metadata ||
+          {},
+
+        externalId:
+          shipment.externalId ||
+          null,
+
+        remoteCallPerformed:
+          false,
+
+        databaseMutationPerformed:
+          false
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+
+/**
+ * POST /api/delivery/colissimo/dispatch-preview
+ *
+ * Prévisualisation avant envoi réel.
+ *
+ * - aucun POST Colissimo
+ * - aucun token retourné
+ * - aucune mutation MongoDB
+ * - calcule le hash du payload réel
+ */
+router.post(
+  '/colissimo/dispatch-preview',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const result =
+        await buildColissimoDispatchPreview({
+          shopId:
+            req.user.shopId,
+
+          reservationId:
+            req.body?.reservationId
+        });
+
+      return res.json(
+        result
+      );
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(
+            error.statusCode
+          )
+          .json({
+            error:
+              error.message
+          });
+      }
+
+      next(error);
+    }
+  }
+);
+
 
 /**
  * GET /api/delivery/intigo/capabilities
