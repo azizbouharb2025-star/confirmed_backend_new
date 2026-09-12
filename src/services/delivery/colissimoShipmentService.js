@@ -1237,11 +1237,14 @@ const dispatchColissimoReservation =
     }
 
     /*
-     * SECOND VERROU LIVE :
-     * allowlist explicite.
+     * Allowlist optionnelle.
      *
-     * Fail closed :
-     * vide = aucun colis autorisé.
+     * - variable vide/absente :
+     *   toutes les commandes préparées correctement
+     *   peuvent être envoyées.
+     *
+     * - variable renseignée :
+     *   seules les références listées sont autorisées.
      */
     const allowedLiveCids =
       String(
@@ -1256,7 +1259,7 @@ const dispatchColissimoReservation =
         .filter(Boolean);
 
     if (
-      allowedLiveCids.length === 0 ||
+      allowedLiveCids.length > 0 &&
       !allowedLiveCids.includes(
         cleanExpectedCid
       )
