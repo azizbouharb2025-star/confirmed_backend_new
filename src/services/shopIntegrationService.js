@@ -372,6 +372,25 @@ class ShopIntegrationService {
       throw new Error(`Shop not found: ${shopId}`);
     }
 
+    const boundStoreId =
+      shop.convertyCredentials?.storeId
+        ? String(
+            shop.convertyCredentials.storeId
+          )
+        : '';
+
+    if (!boundStoreId) {
+      const error =
+        new Error(
+          'Converty store is not bound to this Confirmed shop'
+        );
+
+      error.code =
+        'CONVERTY_STORE_NOT_BOUND';
+
+      throw error;
+    }
+
     const accessToken =
       await this.getConvertyAccessToken(
         shop
@@ -556,9 +575,32 @@ class ShopIntegrationService {
         );
       }
 
-      fetched += orders.length;
+      const scopedOrders =
+        orders.filter(source =>
+          String(source?.store || '') ===
+          boundStoreId
+        );
 
-      for (const source of orders) {
+      const ignoredForeignOrders =
+        orders.length -
+        scopedOrders.length;
+
+      if (ignoredForeignOrders > 0) {
+        logger.warn(
+          'Ignored Converty orders from another store',
+          {
+            shopId:
+              String(shopId),
+            boundStoreId,
+            ignored:
+              ignoredForeignOrders
+          }
+        );
+      }
+
+      fetched += scopedOrders.length;
+
+      for (const source of scopedOrders) {
         const orderId =
           source?._id
             ? String(source._id)

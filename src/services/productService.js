@@ -80,6 +80,25 @@ class ProductService {
       throw new Error('Shop is not a Converty shop');
     }
 
+    const boundStoreId =
+      shop.convertyCredentials?.storeId
+        ? String(
+            shop.convertyCredentials.storeId
+          )
+        : '';
+
+    if (!boundStoreId) {
+      const error =
+        new Error(
+          'Converty store is not bound to this Confirmed shop'
+        );
+
+      error.code =
+        'CONVERTY_STORE_NOT_BOUND';
+
+      throw error;
+    }
+
     /*
      * Lazy require avoids a module initialization cycle:
      * shopIntegrationService already imports productService.
@@ -142,9 +161,32 @@ class ProductService {
         );
       }
 
-      fetched += products.length;
+      const scopedProducts =
+        products.filter(source =>
+          String(source?.store || '') ===
+          boundStoreId
+        );
 
-      for (const source of products) {
+      const ignoredForeignProducts =
+        products.length -
+        scopedProducts.length;
+
+      if (ignoredForeignProducts > 0) {
+        logger.warn(
+          'Ignored Converty products from another store',
+          {
+            shopId:
+              String(shopId),
+            boundStoreId,
+            ignored:
+              ignoredForeignProducts
+          }
+        );
+      }
+
+      fetched += scopedProducts.length;
+
+      for (const source of scopedProducts) {
         const externalId =
           source?._id
             ? String(source._id)

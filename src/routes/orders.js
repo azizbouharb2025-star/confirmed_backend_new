@@ -366,12 +366,25 @@ router.get('/recent', auth, async (req, res, next) => {
         ? Math.min(requestedLimit, 20)
         : 5;
 
-    const shopId =
-      req.user.role === 'shop_owner'
-        ? req.user.shopId
-        : null;
+    const isAdmin =
+      req.user.role === 'admin';
 
-    const query = shopId ? { shopId } : {};
+    const shopId =
+      isAdmin
+        ? null
+        : req.user.shopId;
+
+    if (
+      !isAdmin &&
+      !shopId
+    ) {
+      return res.json([]);
+    }
+
+    const query =
+      shopId
+        ? { shopId }
+        : {};
 
     const orders = await Order.find(query)
       .sort({ createdAt: -1 })

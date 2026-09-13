@@ -301,7 +301,18 @@ router.post('/shop/:shopId/sync', auth, async (req, res) => {
         : {})
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    if (error.code === 'CONVERTY_STORE_NOT_BOUND') {
+      return res.status(409).json({
+        error:
+          'Cette boutique n’est pas encore connectée à un store Converty.'
+      });
+    }
+
+    res.status(500).json({
+      error:
+        error.message ||
+        'Erreur lors de la synchronisation des produits.'
+    });
   }
 });
 

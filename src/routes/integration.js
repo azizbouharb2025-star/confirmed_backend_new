@@ -48,6 +48,217 @@ function getConvertyConfig() {
   };
 }
 
+
+function normalizeConvertyStoreId(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === 'object') {
+    const nested =
+      value._id ||
+      value.id ||
+      value.storeId ||
+      null;
+
+    return nested
+      ? String(nested)
+      : null;
+  }
+
+  return String(value);
+}
+
+function extractConvertyCollection(payload, keys = []) {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+
+  for (const key of keys) {
+    if (Array.isArray(payload?.[key])) {
+      return payload[key];
+    }
+  }
+
+  return [];
+}
+
+function findSingleConvertyStoreId(items) {
+  const storeIds = [
+    ...new Set(
+      (Array.isArray(items) ? items : [])
+        .map(item =>
+          normalizeConvertyStoreId(
+            item?.store ||
+            item?.storeId ||
+            null
+          )
+        )
+        .filter(Boolean)
+    )
+  ];
+
+  if (storeIds.length > 1) {
+    const error =
+      new Error(
+        'OAuth token exposes multiple Converty stores'
+      );
+
+    error.code =
+      'CONVERTY_MULTIPLE_STORES';
+
+    throw error;
+  }
+
+  return storeIds[0] || null;
+}
+
+async function resolveConvertyStoreId(
+  accessToken,
+  tokenData = {}
+) {
+  /*
+   * Prefer an explicit store returned during OAuth.
+   */
+  const tokenStoreId =
+    normalizeConvertyStoreId(
+      tokenData.store ||
+      tokenData.store_id ||
+      tokenData.storeId ||
+      null
+    );
+
+  if (tokenStoreId) {
+    return tokenStoreId;
+  }
+
+  /*
+   * Converty currently does not expose the store through
+   * the OAuth token response in all cases.
+   *
+   * Products are preferred for discovery because order
+   * reads are more aggressively rate-limited.
+   */
+  const productResponse =
+    await axios.get(
+      `${CONVERTY_API_BASE_URL}/products`,
+      {
+        params: {
+          page: 1,
+          limit: 50
+        },
+        headers: {
+          Authorization:
+            `Bearer ${accessToken}`,
+          Accept:
+            'application/json'
+        },
+        timeout: 15000,
+        validateStatus:
+          () => true
+      }
+    );
+
+  if (
+    productResponse.status >= 200 &&
+    productResponse.status < 300
+  ) {
+    const root =
+      productResponse.data || {};
+
+    const payload =
+      root.data ?? root;
+
+    const products =
+      extractConvertyCollection(
+        payload,
+        [
+          'products',
+          'items',
+          'docs'
+        ]
+      );
+
+    const productStoreId =
+      findSingleConvertyStoreId(
+        products
+      );
+
+    if (productStoreId) {
+      return productStoreId;
+    }
+  }
+
+  /*
+   * Fallback only when products do not reveal the store.
+   * This request happens once during OAuth, not as polling.
+   */
+  const orderResponse =
+    await axios.get(
+      `${CONVERTY_API_BASE_URL}/orders`,
+      {
+        params: {
+          page: 1,
+          limit: 10
+        },
+        headers: {
+          Authorization:
+            `Bearer ${accessToken}`,
+          Accept:
+            'application/json'
+        },
+        timeout: 15000,
+        validateStatus:
+          () => true
+      }
+    );
+
+  if (
+    orderResponse.status >= 200 &&
+    orderResponse.status < 300
+  ) {
+    const root =
+      orderResponse.data || {};
+
+    const payload =
+      root.data ?? root;
+
+    const orders =
+      extractConvertyCollection(
+        payload,
+        [
+          'orders',
+          'items',
+          'docs'
+        ]
+      );
+
+    const orderStoreId =
+      findSingleConvertyStoreId(
+        orders
+      );
+
+    if (orderStoreId) {
+      return orderStoreId;
+    }
+  }
+
+  const error =
+    new Error(
+      'Unable to determine the Converty store for this OAuth connection'
+    );
+
+  error.code =
+    orderResponse.status === 429
+      ? 'CONVERTY_STORE_RESOLUTION_RATE_LIMIT'
+      : 'CONVERTY_STORE_NOT_RESOLVED';
+
+  error.status =
+    orderResponse.status;
+
+  throw error;
+}
+
 function createConvertyState(shopId) {
   const { clientSecret } = getConvertyConfig();
 
@@ -774,21 +985,61 @@ router.get(
           0
         );
 
-      const rawStore =
-        tokenData.store ||
-        tokenData.store_id ||
-        tokenData.storeId ||
-        null;
-
       const storeId =
-        rawStore &&
-        typeof rawStore === 'object'
-          ? (
-              rawStore._id ||
-              rawStore.id ||
-              null
-            )
-          : rawStore;
+        await resolveConvertyStoreId(
+          accessToken,
+          tokenData
+        );
+
+      if (!storeId) {
+        return res.status(502).json({
+          error:
+            'Converty store could not be resolved'
+        });
+      }
+
+      const existingStoreBinding =
+        await Shop.findOne({
+          _id: {
+            $ne:
+              stateData.shopId
+          },
+          platform:
+            'converty',
+          isActive:
+            true,
+          'convertyCredentials.storeId':
+            String(storeId)
+        })
+          .select(
+            '_id name'
+          )
+          .lean();
+
+      if (existingStoreBinding) {
+        logger.warn(
+          'Converty store already bound to another Confirmed shop',
+          {
+            requestedShopId:
+              String(stateData.shopId),
+            existingShopId:
+              String(
+                existingStoreBinding._id
+              ),
+            storeId:
+              String(storeId)
+          }
+        );
+
+        const frontendUrl =
+          (process.env.FRONTEND_URL || 'https://confirmed.tn')
+            .replace(/\/$/, '');
+
+        return res.redirect(
+          302,
+          `${frontendUrl}/panel/client/shops?converty=already-connected`
+        );
+      }
 
       const rawScopes =
         tokenData.grantedScopes ||
@@ -825,11 +1076,9 @@ router.get(
           tokenData.tokenType;
       }
 
-      if (storeId) {
-        update[
-          'convertyCredentials.storeId'
-        ] = String(storeId);
-      }
+      update[
+        'convertyCredentials.storeId'
+      ] = String(storeId);
 
       if (grantedScopes.length) {
         update[

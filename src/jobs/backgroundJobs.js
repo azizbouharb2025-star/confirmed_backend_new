@@ -199,6 +199,11 @@ class BackgroundJobs {
                     'convertyCredentials.accessToken': {
                       $exists: true,
                       $ne: ''
+                    },
+
+                    'convertyCredentials.storeId': {
+                      $exists: true,
+                      $ne: ''
                     }
                   })
                     .select(

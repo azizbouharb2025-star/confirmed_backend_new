@@ -64,13 +64,31 @@ class OrderService {
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
 
+    // Non-admin users must always be attached to a shop.
+    // Never fall back to a global order query.
+    if (
+      user.role !== 'admin' &&
+      !user.shopId
+    ) {
+      return {
+        orders: [],
+        total: 0,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: 0
+      };
+    }
+
     // Build query
     const query = {};
 
-    // Shop filter - non-admin users can only see their own shop's orders
-    if (user.role === 'admin' && shopId) {
-      query.shopId = shopId;
-    } else if (user.shopId) {
+    // Admin may optionally filter by shop.
+    // Every other user is strictly restricted to their shop.
+    if (user.role === 'admin') {
+      if (shopId) {
+        query.shopId = shopId;
+      }
+    } else {
       query.shopId = user.shopId;
     }
 
@@ -186,6 +204,15 @@ class OrderService {
    * @returns {Promise<Object>} Order object
    */
   async findOrderById(id, user = {}) {
+    if (
+      user.role !== 'admin' &&
+      !user.shopId
+    ) {
+      const error = new Error('Access denied');
+      error.statusCode = 403;
+      throw error;
+    }
+
     const order = await Order.findById(id)
       .populate('assignedOperatorId', 'name email')
       .populate('callHistory.operatorId', 'name firstName lastName email')
