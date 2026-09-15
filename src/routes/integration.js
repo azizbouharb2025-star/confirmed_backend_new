@@ -388,6 +388,63 @@ async function ensureConvertyWebhookSubscriptions(
     }
   ];
 
+  const hooksResponse = await axios.get(
+    `${CONVERTY_API_BASE_URL}/hooks`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json'
+      },
+      timeout: 15000,
+      validateStatus: () => true
+    }
+  );
+
+  if (hooksResponse.status < 200 || hooksResponse.status >= 300) {
+    throw new Error('Unable to list Converty webhook subscriptions');
+  }
+
+  const registeredHooks = Array.isArray(hooksResponse.data?.data)
+    ? hooksResponse.data.data
+    : [];
+
+  const desiredTargets = new Map(
+    subscriptions.map(({ event, targetUrl }) => [event, targetUrl])
+  );
+
+  for (const hook of registeredHooks) {
+    const targetUrl = String(hook?.targetUrl || '');
+    const desiredTarget = desiredTargets.get(hook?.event);
+    const managed = targetUrl.startsWith(
+      `${webhookOrigin}/api/integration/converty/`
+    );
+
+    if (!managed || !desiredTarget || targetUrl === desiredTarget) {
+      continue;
+    }
+
+    const deleteResponse = await axios.delete(
+      `${CONVERTY_API_BASE_URL}/hooks/unsubscribe/${hook._id}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json'
+        },
+        timeout: 15000,
+        validateStatus: () => true
+      }
+    );
+
+    if (deleteResponse.status < 200 || deleteResponse.status >= 300) {
+      throw new Error(`Unable to remove stale Converty webhook ${hook.event}`);
+    }
+
+    logger.info('Converty stale webhook unsubscribed', {
+      shopId: String(shop._id),
+      event: hook.event
+    });
+  }
+
   for (const {
     event,
     targetUrl
