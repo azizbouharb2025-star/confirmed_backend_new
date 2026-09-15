@@ -1156,13 +1156,24 @@ const dispatchColissimoReservation =
         ''
       ).trim();
 
-    const baseUrl =
+    const configuredBaseUrl =
       String(
         integration
           ?.credentials
           ?.baseUrl ||
-        'https://colissimodelivery.tn/api/v1/post.php'
+        ''
       ).trim();
+
+    /*
+     * Colissimo creation MUST target post.php.
+     * Never POST shipment data to the website root.
+     */
+    const baseUrl =
+      configuredBaseUrl.includes(
+        '/api/v1/post.php'
+      )
+        ? configuredBaseUrl
+        : 'https://colissimodelivery.tn/api/v1/post.php';
 
     if (!addToken) {
       throw makeError(
@@ -1476,10 +1487,18 @@ const dispatchColissimoReservation =
             lastError: {
               message:
                 String(
-                  responseData
-                    .status_message ||
+                  responseData?.status_message ||
+                  responseData?.message ||
+                  responseData?.error ||
+                  responseData?.msg ||
+                  (
+                    Array.isArray(responseData?.errors)
+                      ? responseData.errors.join(' | ')
+                      : responseData?.errors
+                  ) ||
+                  JSON.stringify(responseData) ||
                   'Colissimo creation rejected'
-                ),
+                ).slice(0, 2000),
 
               code:
                 responseData.status ??
@@ -1504,9 +1523,24 @@ const dispatchColissimoReservation =
         }
       );
 
+      const providerMessage =
+        String(
+          responseData?.status_message ||
+          responseData?.message ||
+          responseData?.error ||
+          responseData?.msg ||
+          (
+            Array.isArray(responseData?.errors)
+              ? responseData.errors.join(' | ')
+              : responseData?.errors
+          ) ||
+          JSON.stringify(responseData) ||
+          'Colissimo creation rejected'
+        ).slice(0, 2000);
+
       const error =
         new Error(
-          'Colissimo rejected shipment creation'
+          `Colissimo: ${providerMessage}`
         );
 
       error.statusCode = 400;

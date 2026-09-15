@@ -172,7 +172,11 @@ deliveryShipmentSchema.index(
   },
   {
     unique: true,
-    sparse: true,
+    partialFilterExpression: {
+      externalId: {
+        $type: 'string'
+      }
+    },
     name: 'delivery_provider_external_unique'
   }
 );

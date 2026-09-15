@@ -647,6 +647,33 @@ router.post(
               await shopIntegrationService
                 .syncConvertyOrders(shopId);
 
+            const externalOrderId = [
+              req.body?.data?._id,
+              req.body?.data?.id,
+              req.body?.data?.orderId,
+              req.body?.data?.order?._id,
+              req.body?.data?.order?.id,
+              req.body?.order?._id,
+              req.body?.order?.id,
+              req.body?._id,
+              req.body?.id,
+              req.body?.orderId,
+              req.body?.order_id
+            ].find(Boolean);
+
+            if (
+              externalOrderId &&
+              /^[a-f0-9]{24}$/i.test(
+                String(externalOrderId)
+              )
+            ) {
+              await shopIntegrationService
+                .syncConvertyOrderStatus(
+                  shopId,
+                  String(externalOrderId)
+                );
+            }
+
             logger.info(
               'Converty webhook sync completed',
               {

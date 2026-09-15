@@ -365,6 +365,99 @@ class ShopIntegrationService {
     return nextAccessToken;
   }
 
+  async syncConvertyOrderStatus(
+    shopId,
+    externalOrderId
+  ) {
+    const shop = await Shop.findById(shopId);
+
+    if (!shop) {
+      throw new Error(`Shop not found: ${shopId}`);
+    }
+
+    const accessToken =
+      await this.getConvertyAccessToken(shop);
+
+    const response = await axios.get(
+      'https://api.converty.shop/api/v1/orders/' +
+        encodeURIComponent(externalOrderId),
+      {
+        headers: {
+          Authorization:
+            `Bearer ${accessToken}`,
+          Accept: 'application/json'
+        },
+        timeout: 15000,
+        validateStatus: () => true
+      }
+    );
+
+    if (
+      response.status < 200 ||
+      response.status >= 300
+    ) {
+      const error =
+        new Error(
+          'Unable to fetch Converty order status'
+        );
+
+      error.status = response.status;
+      throw error;
+    }
+
+    const source =
+      response.data?.data?.order ||
+      response.data?.data ||
+      response.data ||
+      {};
+
+    const rawStatus =
+      String(
+        source.status ||
+        source.orderStatus ||
+        ''
+      ).trim();
+
+    if (!rawStatus) {
+      return {
+        matched: false,
+        updated: false
+      };
+    }
+
+    const result = await Order.updateOne(
+      {
+        shopId,
+        $or: [
+          {
+            orderId:
+              String(externalOrderId)
+          },
+          {
+            externalOrderId:
+              String(externalOrderId)
+          }
+        ]
+      },
+      {
+        $set: {
+          externalStatus: {
+            platform: 'converty',
+            code:
+              rawStatus.toLowerCase(),
+            label: rawStatus,
+            syncedAt: new Date()
+          }
+        }
+      }
+    );
+
+    return {
+      matched: result.matchedCount > 0,
+      updated: result.modifiedCount > 0
+    };
+  }
+
   async syncConvertyOrders(shopId) {
     const shop = await Shop.findById(shopId);
 
@@ -871,6 +964,14 @@ class ShopIntegrationService {
               'clientInfo.address.city'
             ] =
               source.customer.city;
+
+            syncedFields[
+              'clientInfo.address.state'
+            ] =
+              source.customer.city;
+
+            syncedFields.region =
+              source.customer.city;
           }
 
           const normalizeItems =
@@ -937,7 +1038,14 @@ class ShopIntegrationService {
 
             city:
               existingOrder.clientInfo
-                ?.address?.city || ''
+                ?.address?.city || '',
+
+            state:
+              existingOrder.clientInfo
+                ?.address?.state || '',
+
+            region:
+              existingOrder.region || ''
           };
 
           const nextComparable = {
@@ -978,7 +1086,17 @@ class ShopIntegrationService {
               syncedFields[
                 'clientInfo.address.city'
               ] ??
-              currentComparable.city
+              currentComparable.city,
+
+            state:
+              syncedFields[
+                'clientInfo.address.state'
+              ] ??
+              currentComparable.state,
+
+            region:
+              syncedFields.region ??
+              currentComparable.region
           };
 
           const hasChanges =
@@ -1039,10 +1157,18 @@ class ShopIntegrationService {
 
                       city:
                         source?.customer?.city ||
+                        '',
+
+                      state:
+                        source?.customer?.city ||
                         ''
                     }
                   : undefined
             },
+
+            region:
+              source?.customer?.city ||
+              '',
 
             items,
 

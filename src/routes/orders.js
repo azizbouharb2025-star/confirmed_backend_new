@@ -90,6 +90,11 @@ const operatorDetailsSchema = Joi.object({
     name: Joi.string().trim().min(1),
     phone: Joi.string().trim().min(1),
 
+    email: Joi.string()
+      .email()
+      .allow('')
+      .trim(),
+
     additionalPhones: Joi.array()
       .items(Joi.string().trim().min(1))
       .max(10),
@@ -410,6 +415,7 @@ router.get('/recent', auth, async (req, res, next) => {
         items: order.items || [],
         totalAmount: order.totalAmount || 0,
         status: order.status,
+        externalStatus: order.externalStatus || null,
         aiScore:
           typeof order.aiScore === 'number'
             ? order.aiScore
@@ -751,7 +757,7 @@ router.post(
 router.patch(
   '/:id/operator-details',
   auth,
-  authorize('operator', 'admin'),
+  authorize('operator', 'admin', 'shop_owner'),
   async (req, res, next) => {
     try {
       const { error, value } = operatorDetailsSchema.validate(

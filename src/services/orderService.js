@@ -1,4 +1,5 @@
 const Order = require('../models/Order');
+const DeliveryShipment = require('../models/DeliveryShipment');
 const logger = require('../utils/logger');
 const { emitOrderUpdate, emitOrderNew, emitOrderDelete } = require('../websocket/orderEvents');
 const { logActivity } = require('./activityLogService');
@@ -184,8 +185,104 @@ class OrderService {
         )
         .populate('courier', 'name');
 
+      /*
+       * Expédition transporteur associée aux commandes.
+       *
+       * Modèle commun :
+       * Colissimo / Intigo / futurs transporteurs API.
+       *
+       * On privilégie une expédition créée devant
+       * une préparation ou un échec.
+       */
+      const orderIds =
+        orders.map(order =>
+          order._id
+        );
+
+      const shipments =
+        orderIds.length > 0
+          ? await DeliveryShipment.find({
+              orderId: {
+                $in: orderIds
+              }
+            })
+              .sort({
+                updatedAt: -1
+              })
+              .select({
+                orderId: 1,
+                provider: 1,
+                state: 1,
+                externalId: 1,
+                providerStatusCode: 1,
+                providerStatusLabel: 1,
+                updatedAt: 1
+              })
+              .lean()
+          : [];
+
+      const statePriority = {
+        created: 60,
+        dispatching: 50,
+        reconcile_required: 40,
+        preparing: 30,
+        failed: 20,
+        cancelled: 10
+      };
+
+      const shipmentByOrderId =
+        new Map();
+
+      for (const shipment of shipments) {
+        const key =
+          String(
+            shipment.orderId
+          );
+
+        const current =
+          shipmentByOrderId.get(
+            key
+          );
+
+        const shipmentPriority =
+          statePriority[
+            shipment.state
+          ] || 0;
+
+        const currentPriority =
+          current
+            ? statePriority[
+                current.state
+              ] || 0
+            : -1;
+
+        if (
+          !current ||
+          shipmentPriority >
+            currentPriority
+        ) {
+          shipmentByOrderId.set(
+            key,
+            shipment
+          );
+        }
+      }
+
+      const enrichedOrders =
+        orders.map(order => {
+          const value =
+            order.toObject();
+
+          value.deliveryShipment =
+            shipmentByOrderId.get(
+              String(order._id)
+            ) || null;
+
+          return value;
+        });
+
       return {
-        orders,
+        orders: enrichedOrders,
         total,
         page: pageNum,
         limit: limitNum,
@@ -1841,6 +1938,32 @@ class OrderService {
     }
 
     /*
+     * Un propriétaire de boutique ne peut modifier
+     * que les commandes appartenant à sa propre boutique.
+     */
+    if (user.role === 'shop_owner') {
+      const orderShopId = order.shopId
+        ? String(order.shopId)
+        : null;
+
+      const userShopId = user.shopId
+        ? String(user.shopId)
+        : null;
+
+      if (
+        !orderShopId ||
+        !userShopId ||
+        orderShopId !== userShopId
+      ) {
+        const error = new Error(
+          'Vous n’avez pas accès à cette commande.'
+        );
+        error.statusCode = 403;
+        throw error;
+      }
+    }
+
+    /*
      * Une commande déjà finalisée ou expédiée ne doit pas
      * être modifiée depuis la File d'attente.
      */
@@ -1935,6 +2058,11 @@ class OrderService {
 
       if (client.phone !== undefined) {
         order.clientInfo.phone = client.phone.trim();
+      }
+
+      if (client.email !== undefined) {
+        order.clientInfo.email =
+          client.email.trim();
       }
 
       if (client.additionalPhones !== undefined) {

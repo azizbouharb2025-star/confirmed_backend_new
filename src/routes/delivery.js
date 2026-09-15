@@ -22,6 +22,10 @@ const {
 } = require('../services/delivery/intigoStatusService');
 
 const {
+  syncColissimoShipmentStatus
+} = require('../services/delivery/colissimoStatusService');
+
+const {
   analyzeColissimoOrders,
   reserveColissimoShipments,
   isActiveColissimoPreparingShipment,
@@ -501,6 +505,52 @@ router.get(
   }
 );
 
+
+
+/**
+ * POST /api/delivery/colissimo/status/:orderId
+ *
+ * Synchronise le statut d'un colis déjà créé.
+ * Aucun nouveau colis n'est créé.
+ */
+router.post(
+  '/colissimo/status/:orderId',
+  auth,
+  authorize('shop_owner'),
+  async (req, res, next) => {
+    try {
+      if (!req.user.shopId) {
+        return res.status(400).json({
+          error:
+            'No shop associated with user'
+        });
+      }
+
+      const result =
+        await syncColissimoShipmentStatus({
+          shopId:
+            req.user.shopId,
+
+          orderId:
+            req.params.orderId
+        });
+
+      return res.json(result);
+    } catch (error) {
+      if (error.statusCode) {
+        return res
+          .status(error.statusCode)
+          .json({
+            success: false,
+            provider: 'colissimo',
+            error: error.message
+          });
+      }
+
+      next(error);
+    }
+  }
+);
 
 
 /**

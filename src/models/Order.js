@@ -82,6 +82,27 @@ const orderSchema = new mongoose.Schema({
     enum: ['pending', 'assigned', 'in_progress', 'confirmed', 'rejected', 'cancelled', 'postponed', 'shipped', 'delivered', 'failed_delivery'],
     default: 'pending'
   },
+
+  /*
+   * Statut provenant de la plateforme e-commerce.
+   * Il reste séparé du workflow opérateur Confirmed.
+   */
+  externalStatus: {
+    platform: {
+      type: String,
+      trim: true
+    },
+    code: {
+      type: String,
+      trim: true
+    },
+    label: {
+      type: String,
+      trim: true
+    },
+    syncedAt: Date
+  },
+
   deliveryInfo: {
     estimatedDate: Date,
     trackingNumber: String,
