@@ -160,7 +160,20 @@ router.get('/', auth, async (req, res, next) => {
   try {
     const query = req.user.role === 'admin' ? {} : { _id: req.user.shopId };
     const shops = await Shop.find(query).populate('subscriptionId');
-    res.json(shops);
+
+    const serializedShops =
+      shops.map(shop => {
+        const serialized = shop.toObject();
+
+        serialized.convertyConnected =
+          Boolean(
+            serialized.convertyCredentials?.storeId
+          );
+
+        return serialized;
+      });
+
+    res.json(serializedShops);
   } catch (error) {
     next(error);
   }

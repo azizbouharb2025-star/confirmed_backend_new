@@ -1311,7 +1311,8 @@ router.get(
       return res.json({
         connected:
           Boolean(
-            shop.convertyCredentials?.accessToken
+            shop.convertyCredentials?.accessToken &&
+            shop.convertyCredentials?.storeId
           ),
         platform: shop.platform,
         storeId:
