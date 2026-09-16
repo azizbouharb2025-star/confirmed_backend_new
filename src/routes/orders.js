@@ -2,7 +2,7 @@ const express = require('express');
 const Joi = require('joi');
 const multer = require('multer');
 const Order = require('../models/Order');
-require('../models/Product');
+const Product = require('../models/Product');
 const ImportHistory = require('../models/ImportHistory');
 const ExportTemplate = require('../models/ExportTemplate');
 const { auth, authorize } = require('../middleware/auth');
@@ -54,14 +54,20 @@ const createOrderSchema = Joi.object({
       country: Joi.string()
     })
   }).required(),
-  items: Joi.array().items(Joi.object({
-    name: Joi.string(),
-    quantity: Joi.number(),
-    price: Joi.number(),
-    sku: Joi.string()
-  })),
+  items: Joi.array()
+    .items(
+      Joi.object({
+        productId: Joi.string().hex().length(24).required(),
+        quantity: Joi.number().integer().min(1).required(),
+        price: Joi.number().min(0).required()
+      })
+    )
+    .min(1)
+    .required(),
   deliveryFee: Joi.number().min(0),
-  totalAmount: Joi.number().required(),
+  // Le frontend peut encore envoyer totalAmount pour compatibilité,
+  // mais la valeur n'est jamais utilisée comme source de vérité.
+  totalAmount: Joi.number().min(0).optional(),
   deliveryInfo: Joi.object({
     estimatedDate: Joi.date(),
     trackingNumber: Joi.string(),
@@ -337,8 +343,123 @@ router.post('/', auth, authorize('shop_owner'), async (req, res, next) => {
       ...manualOrderData
     } = req.body;
 
+    /*
+     * Commande manuelle :
+     * tous les articles doivent provenir du catalogue réel
+     * de la boutique connectée.
+     */
+    const requestedItems = manualOrderData.items || [];
+
+    const productIds = [
+      ...new Set(
+        requestedItems.map(item => item.productId)
+      )
+    ];
+
+    const products = await Product.find({
+      _id: {
+        $in: productIds
+      },
+      shopId: req.user.shopId,
+      isActive: true
+    })
+      .select(
+        '_id name sku price deliveryFee imageUrl'
+      )
+      .lean();
+
+    /*
+     * Un productId inconnu ou appartenant à une autre
+     * boutique doit bloquer la création.
+     */
+    if (products.length !== productIds.length) {
+      return res.status(422).json({
+        error:
+          'Un ou plusieurs produits sont introuvables ou ne sont pas accessibles pour cette boutique.'
+      });
+    }
+
+    const productsById = new Map(
+      products.map(product => [
+        product._id.toString(),
+        product
+      ])
+    );
+
+    const items = requestedItems.map(item => {
+      const product =
+        productsById.get(item.productId);
+
+      return {
+        productId: product._id,
+        name: product.name,
+        quantity: item.quantity,
+        price: item.price,
+        ...(product.sku && {
+          sku: product.sku
+        })
+      };
+    });
+
+    /*
+     * Une commande possède un seul deliveryFee.
+     *
+     * Par défaut on prend le frais catalogue le plus élevé
+     * parmi les produits sélectionnés.
+     *
+     * La valeur envoyée manuellement par le vendeur reste
+     * prioritaire lorsqu'il décide de la modifier.
+     */
+    const catalogDeliveryFee =
+      requestedItems.length > 0
+        ? Math.max(
+            ...requestedItems.map(item => {
+              const product =
+                productsById.get(item.productId);
+
+              return Number(
+                product?.deliveryFee || 0
+              );
+            })
+          )
+        : 0;
+
+    const deliveryFee =
+      manualOrderData.deliveryFee !== undefined
+        ? Number(manualOrderData.deliveryFee)
+        : catalogDeliveryFee;
+
+    /*
+     * Le total envoyé par le navigateur n'est jamais
+     * considéré comme fiable.
+     */
+    const itemsSubtotal = items.reduce(
+      (sum, item) =>
+        sum +
+        Number(item.quantity) *
+          Number(item.price),
+      0
+    );
+
+    const totalAmount = Number(
+      (
+        itemsSubtotal +
+        deliveryFee
+      ).toFixed(3)
+    );
+
+    const governorate =
+      manualOrderData.clientInfo?.address?.state?.trim() ||
+      '';
+
     const order = await orderService.createOrder({
       ...manualOrderData,
+      items,
+      deliveryFee,
+      totalAmount,
+      ...(governorate && {
+        region: governorate
+      }),
       shopId: req.user.shopId
     });
 
