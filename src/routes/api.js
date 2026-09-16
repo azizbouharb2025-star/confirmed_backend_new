@@ -4,6 +4,7 @@ const subscriptionService = require('../services/subscriptionService');
 const productService = require('../services/productService');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
+const aiScoringService = require('../services/aiScoringService');
 
 const router = express.Router();
 
@@ -47,7 +48,9 @@ router.post('/orders', apiAuth, async (req, res, next) => {
       shopId: req.shop._id
     });
 
+    await aiScoringService.enrichOrder(order);
     await order.save();
+
     res.status(201).json(order);
   } catch (error) {
     next(error);

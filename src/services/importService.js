@@ -699,7 +699,7 @@ async function processImport(fileBuffer, mimetype, options = {}) {
       const payload = rowToOrderPayload(mappedRows[preview.rowIndex], shopId);
       const order = new Order(payload);
 
-      aiScoringService.enrichOrder(order);
+      await aiScoringService.enrichOrder(order);
 
       await order.save();
       importedOrders.push(order._id);

@@ -1,3 +1,5 @@
+const Order = require('../models/Order');
+
 class AIScoringService {
   /**
    * Ajustement comportemental V1.
@@ -10,16 +12,21 @@ class AIScoringService {
    * le score sans remplacer les autres facteurs.
    */
   calculateOperatorFeedbackAdjustment(feedback) {
-    if (!feedback) {
+    if (!feedback || !feedback.submittedAt) {
       return {
         adjustment: 0,
         applied: false,
-        summary: ''
+        summary: 'Aucun retour opérateur'
       };
     }
 
-    let raw = 0;
-
+    /*
+     * PDF Scoring IA :
+     * maximum 3 observations de ton/comportement.
+     *
+     * La validation HTTP applique déjà cette limite.
+     * On la réapplique ici par sécurité.
+     */
     const toneWeights = {
       polite: 1,
       confident: 1,
@@ -27,34 +34,19 @@ class AIScoringService {
       quick_response: 1,
 
       hesitant: -1,
-      distracted: -2,
-      long_pauses: -2,
-      rude: -3,
-      aggressive: -3,
-      nervous: -2,
+      distracted: -1,
+      long_pauses: -1,
+
+      rude: -2,
+      aggressive: -2,
+      nervous: -1,
       low_interest: -2
     };
-
-    const toneRaw = Array.isArray(
-      feedback.toneSignals
-    )
-      ? feedback.toneSignals.reduce(
-          (total, signal) =>
-            total + (toneWeights[signal] || 0),
-          0
-        )
-      : 0;
-
-    // Les signaux de ton ne peuvent pas dominer seuls.
-    raw += Math.max(
-      -4,
-      Math.min(4, toneRaw)
-    );
 
     const confirmationWeights = {
       very_firm: 5,
       normal: 2,
-      weak: -5
+      weak: -4
     };
 
     const priceWeights = {
@@ -67,8 +59,8 @@ class AIScoringService {
     const productWeights = {
       none: 1,
       asks_question: 0,
-      multiple_doubts: -4,
-      compares_seller: -2
+      multiple_doubts: -2,
+      compares_seller: -3
     };
 
     const deliveryWeights = {
@@ -76,7 +68,7 @@ class AIScoringService {
       clear_precise: 3,
       partial: -1,
       vague: -3,
-      difficulty: -3,
+      difficulty: -4,
       refuses_details: -5
     };
 
@@ -89,12 +81,27 @@ class AIScoringService {
     };
 
     const receptionWeights = {
-      wants_fast_delivery: 2,
+      no_information: 0,
+      wants_fast_delivery: 3,
       clearly_confirms_receipt: 3,
       asks_delivery_info: 1,
-      uncertain_receipt: -3,
-      does_not_know_when: -4
+      uncertain_receipt: -2,
+      does_not_know_when: -3
     };
+
+    const toneSignals = [
+      ...new Set(
+        Array.isArray(feedback.toneSignals)
+          ? feedback.toneSignals
+          : []
+      )
+    ].slice(0, 3);
+
+    let raw = 0;
+
+    for (const signal of toneSignals) {
+      raw += toneWeights[signal] || 0;
+    }
 
     raw +=
       confirmationWeights[
@@ -126,147 +133,463 @@ class AIScoringService {
         feedback.receptionIntent
       ] || 0;
 
-    const adjustment = Math.max(
-      -15,
-      Math.min(15, raw)
-    );
-
+    /*
+     * IMPORTANT :
+     * aucun clamp -15/+15 dans le PDF.
+     *
+     * Le clamp global du score final sera appliqué
+     * entre 20 et 97.
+     */
     return {
-      adjustment,
-      applied: adjustment !== 0,
+      adjustment: raw,
+      applied: raw !== 0,
       summary:
-        adjustment > 0
+        raw > 0
           ? 'Retour opérateur globalement favorable'
-          : adjustment < 0
+          : raw < 0
             ? 'Retour opérateur présentant des signaux de vigilance'
             : 'Retour opérateur globalement neutre'
     };
   }
 
   /**
-   * Calculate AI score (0-100) and keep real scoring details
+   * Charge uniquement les données historiques nécessaires
+   * au Score IA.
+   *
+   * L'historique est limité à la boutique actuelle afin
+   * de ne pas mélanger les clients de plusieurs shops.
    */
-  calculateAIScore(order) {
-    let score = 50;
+  async buildScoringContext(order) {
+    const context = {
+      customerHistory: {
+        successfulDeliveries: 0,
+        failedDeliveries: 0
+      }
+    };
+
+    const phone =
+      typeof order.clientInfo?.phone === 'string'
+        ? order.clientInfo.phone.trim()
+        : '';
+
+    const shopId = order.shopId;
+
+    if (!phone || !shopId) {
+      return context;
+    }
+
+    const customerQuery = {
+      shopId,
+      'clientInfo.phone': phone
+    };
+
+    /*
+     * Lors d'un recalcul après confirmation,
+     * la commande existe déjà en base.
+     * Elle ne doit pas compter dans son propre historique.
+     */
+    if (order._id) {
+      customerQuery._id = {
+        $ne: order._id
+      };
+    }
+
+    const [
+      successfulDeliveries,
+      failedDeliveries
+    ] = await Promise.all([
+      Order.countDocuments({
+        ...customerQuery,
+        status: 'delivered'
+      }),
+
+      Order.countDocuments({
+        ...customerQuery,
+        status: 'failed_delivery'
+      })
+    ]);
+
+    context.customerHistory = {
+      successfulDeliveries,
+      failedDeliveries
+    };
+
+    return context;
+  }
+
+  /**
+   * PDF : historique de livraisons réussies.
+   */
+  calculateCustomerSuccessAdjustment(count) {
+    if (count >= 11) return 10;
+    if (count >= 7) return 8;
+    if (count >= 4) return 6;
+    if (count >= 2) return 4;
+    if (count >= 1) return 2;
+
+    return 0;
+  }
+
+  /**
+   * PDF : historique d'échecs de livraison.
+   */
+  calculateCustomerFailureAdjustment(count) {
+    if (count >= 6) return -15;
+    if (count >= 4) return -12;
+    if (count >= 3) return -9;
+    if (count >= 2) return -6;
+    if (count >= 1) return -3;
+
+    return 0;
+  }
+
+  /**
+   * PDF : qualité d'adresse.
+   *
+   * Adresse complète = rue + ville + gouvernorat.
+   * Cette définition reprend les contrôles d'adresse déjà
+   * utilisés par CONFIRMED.
+   */
+  calculateAddressAdjustment(order) {
+    const address = order.clientInfo?.address || {};
+
+    const street = String(
+      address.street || ''
+    ).trim();
+
+    const city = String(
+      address.city || ''
+    ).trim();
+
+    const state = String(
+      address.state ||
+      order.region ||
+      ''
+    ).trim();
+
+    if (street && city && state) {
+      return {
+        adjustment: 6,
+        state: 'complete'
+      };
+    }
+
+    if (street || city || state) {
+      return {
+        adjustment: -3,
+        state: 'partial'
+      };
+    }
+
+    return {
+      adjustment: -10,
+      state: 'missing'
+    };
+  }
+
+  /**
+   * PDF : montant absolu de la commande.
+   *
+   * La deuxième règle du PDF compare également la commande
+   * aux habitudes historiques. Aucun seuil numérique
+   * permettant de définir "légèrement supérieure",
+   * "élevée" ou "très élevée" n'est fourni.
+   * Elle reste donc neutre en V1 plutôt que d'inventer
+   * des seuils.
+   */
+  calculateOrderAmountAdjustment(amount) {
+    const value = Number(amount);
+
+    if (!Number.isFinite(value)) {
+      return 0;
+    }
+
+    if (value < 30) return -1;
+    if (value < 150) return 0;
+    if (value < 250) return -1;
+    if (value < 400) return -3;
+    if (value < 600) return -5;
+
+    return -6;
+  }
+
+  /**
+   * Heure locale tunisienne utilisée par le PDF.
+   */
+  getTunisiaOrderHour(order) {
+    const date =
+      order.createdAt
+        ? new Date(order.createdAt)
+        : new Date();
+
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+
+    const parts =
+      new Intl.DateTimeFormat(
+        'en-GB',
+        {
+          timeZone: 'Africa/Tunis',
+          hour: '2-digit',
+          hour12: false
+        }
+      ).formatToParts(date);
+
+    const hourPart =
+      parts.find(part => part.type === 'hour');
+
+    if (!hourPart) {
+      return null;
+    }
+
+    const hour = Number(hourPart.value);
+
+    if (!Number.isFinite(hour)) {
+      return null;
+    }
+
+    return hour % 24;
+  }
+
+  /**
+   * PDF : heure de commande.
+   */
+  calculateOrderTimeAdjustment(order) {
+    const hour = this.getTunisiaOrderHour(order);
+
+    if (hour === null) {
+      return {
+        adjustment: 0,
+        hour: null
+      };
+    }
+
+    if (hour >= 8 && hour < 22) {
+      return {
+        adjustment: 0,
+        hour
+      };
+    }
+
+    if (hour >= 22) {
+      return {
+        adjustment: -1,
+        hour
+      };
+    }
+
+    if (hour < 2) {
+      return {
+        adjustment: -2,
+        hour
+      };
+    }
+
+    if (hour < 6) {
+      return {
+        adjustment: -3,
+        hour
+      };
+    }
+
+    return {
+      adjustment: -1,
+      hour
+    };
+  }
+
+  /**
+   * Calculate AI score according to Scoring IA PDF.
+   *
+   * Base     : 65
+   * Minimum  : 20
+   * Maximum  : 97
+   */
+  calculateAIScore(order, context = {}) {
+    let score = 65;
 
     const factors = [];
 
-    // Order amount
-    if (order.totalAmount >= 50 && order.totalAmount <= 300) {
-      score += 20;
+    // =====================================================
+    // 1. ADRESSE
+    // =====================================================
 
-      factors.push({
-        key: 'order_amount',
-        label: 'Montant de la commande',
-        value: order.totalAmount,
-        impact: 20,
-        applied: true
-      });
-    } else if (order.totalAmount < 10) {
-      score -= 20;
+    const addressResult =
+      this.calculateAddressAdjustment(order);
 
-      factors.push({
-        key: 'order_amount',
-        label: 'Montant de la commande',
-        value: order.totalAmount,
-        impact: -20,
-        applied: true
-      });
-    } else if (order.totalAmount > 1000) {
-      score -= 10;
+    score += addressResult.adjustment;
 
-      factors.push({
-        key: 'order_amount',
-        label: 'Montant de la commande',
-        value: order.totalAmount,
-        impact: -10,
-        applied: true
-      });
-    } else {
-      factors.push({
-        key: 'order_amount',
-        label: 'Montant de la commande',
-        value: order.totalAmount,
-        impact: 0,
-        applied: false
-      });
-    }
+    factors.push({
+      key: 'address',
+      label: 'Adresse',
+      value: addressResult.state,
+      impact: addressResult.adjustment,
+      applied: addressResult.adjustment !== 0
+    });
 
-    // Repeat buyer
-    if (order.isRepeatBuyer) {
-      score += 15;
-
-      factors.push({
-        key: 'repeat_buyer',
-        label: 'Client récurrent',
-        value: true,
-        impact: 15,
-        applied: true
-      });
-    } else {
-      factors.push({
-        key: 'repeat_buyer',
-        label: 'Client récurrent',
-        value: false,
-        impact: 0,
-        applied: false
-      });
-    }
-
-    // Region
-    const region = (order.region || '').toLowerCase();
-
-    const trustedRegion = [
-      'tunis',
-      'sfax',
-      'sousse',
-      'ariana'
-    ].some(r => region.includes(r));
-
-    if (trustedRegion) {
-      score += 10;
-
-      factors.push({
-        key: 'region',
-        label: 'Région',
-        value: order.region || '',
-        impact: 10,
-        applied: true
-      });
-    } else {
-      factors.push({
-        key: 'region',
-        label: 'Région',
-        value: order.region || '',
-        impact: 0,
-        applied: false
-      });
-    }
+    // =====================================================
+    // 2. ZONE GEOGRAPHIQUE
+    // =====================================================
 
     /*
-     * Retour comportemental opérateur.
-     *
-     * N'intervient qu'après une vraie confirmation
-     * structurée.
+     * V1 du PDF :
+     * aucune ville / aucun gouvernorat ne reçoit
+     * de bonus ou pénalité fixe.
      */
+    factors.push({
+      key: 'region',
+      label: 'Zone géographique',
+      value:
+        order.region ||
+        order.clientInfo?.address?.state ||
+        order.clientInfo?.address?.city ||
+        '',
+      impact: 0,
+      applied: false
+    });
+
+    // =====================================================
+    // 3. VALEUR DE COMMANDE
+    // =====================================================
+
+    const amountAdjustment =
+      this.calculateOrderAmountAdjustment(
+        order.totalAmount
+      );
+
+    score += amountAdjustment;
+
+    factors.push({
+      key: 'order_amount',
+      label: 'Valeur totale de la commande',
+      value: order.totalAmount,
+      impact: amountAdjustment,
+      applied: amountAdjustment !== 0
+    });
+
+    /*
+     * Comparaison historique du montant :
+     * neutralisée tant que les seuils métier ne sont
+     * pas définis dans le cahier des charges.
+     */
+    factors.push({
+      key: 'order_amount_history',
+      label: 'Valeur par rapport aux commandes habituelles',
+      value: 'Seuils non définis',
+      impact: 0,
+      applied: false
+    });
+
+    // =====================================================
+    // 4. HEURE DE COMMANDE
+    // =====================================================
+
+    const timeResult =
+      this.calculateOrderTimeAdjustment(order);
+
+    score += timeResult.adjustment;
+
+    factors.push({
+      key: 'order_time',
+      label: 'Heure de commande',
+      value:
+        timeResult.hour === null
+          ? null
+          : `${String(timeResult.hour).padStart(2, '0')}:00`,
+      impact: timeResult.adjustment,
+      applied: timeResult.adjustment !== 0
+    });
+
+    /*
+     * Le PDF mentionne également les horaires
+     * historiquement associés à plus d'échecs.
+     * Aucun seuil statistique n'étant défini,
+     * ce sous-signal reste neutre.
+     */
+    factors.push({
+      key: 'order_time_history',
+      label: 'Historique de l’heure de commande',
+      value: 'Seuil statistique non défini',
+      impact: 0,
+      applied: false
+    });
+
+    // =====================================================
+    // 5. HISTORIQUE CLIENT
+    // =====================================================
+
+    const successfulDeliveries =
+      Number(
+        context.customerHistory
+          ?.successfulDeliveries
+      ) || 0;
+
+    const failedDeliveries =
+      Number(
+        context.customerHistory
+          ?.failedDeliveries
+      ) || 0;
+
+    const successAdjustment =
+      this.calculateCustomerSuccessAdjustment(
+        successfulDeliveries
+      );
+
+    const failureAdjustment =
+      this.calculateCustomerFailureAdjustment(
+        failedDeliveries
+      );
+
+    score += successAdjustment;
+    score += failureAdjustment;
+
+    factors.push({
+      key: 'customer_success_history',
+      label: 'Livraisons réussies du client',
+      value: successfulDeliveries,
+      impact: successAdjustment,
+      applied: successAdjustment !== 0
+    });
+
+    factors.push({
+      key: 'customer_failure_history',
+      label: 'Échecs de livraison du client',
+      value: failedDeliveries,
+      impact: failureAdjustment,
+      applied: failureAdjustment !== 0
+    });
+
+    // =====================================================
+    // 6. RETOUR OPERATEUR
+    // =====================================================
+
     const operatorBehavior =
       this.calculateOperatorFeedbackAdjustment(
         order.operatorFeedback
       );
 
-    if (operatorBehavior.applied) {
-      score += operatorBehavior.adjustment;
+    score += operatorBehavior.adjustment;
 
-      factors.push({
-        key: 'operator_feedback',
-        label: 'Retour comportemental opérateur',
-        value: operatorBehavior.summary,
-        impact: operatorBehavior.adjustment,
-        applied: true
-      });
-    }
+    factors.push({
+      key: 'operator_feedback',
+      label: 'Retour comportemental opérateur',
+      value: operatorBehavior.summary,
+      impact: operatorBehavior.adjustment,
+      applied: operatorBehavior.applied
+    });
 
-    score = Math.max(0, Math.min(100, Math.round(score)));
+    // =====================================================
+    // FINAL
+    // =====================================================
+
+    score = Math.max(
+      20,
+      Math.min(
+        97,
+        Math.round(score)
+      )
+    );
 
     return {
       score,
@@ -516,16 +839,25 @@ class AIScoringService {
   /**
    * Populate AI fields
    */
-  enrichOrder(order) {
-    const result = this.calculateAIScore(order);
+  async enrichOrder(order) {
+    const context =
+      await this.buildScoringContext(order);
+
+    const result =
+      this.calculateAIScore(
+        order,
+        context
+      );
 
     order.aiScore = result.score;
-    order.riskLevel = this.calculateRiskLevel(result.score);
-    order.aiDecision = this.calculateDecision(result.score);
+    order.riskLevel =
+      this.calculateRiskLevel(result.score);
+    order.aiDecision =
+      this.calculateDecision(result.score);
     order.aiScoredAt = new Date();
 
     order.aiScoreDetails = {
-      baseScore: 50,
+      baseScore: 65,
       finalScore: result.score,
       factors: result.factors
     };

@@ -4,6 +4,7 @@ const Order = require('../models/Order');
 const Shop = require('../models/Shop');
 const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
+const aiScoringService = require('../services/aiScoringService');
 
 const router = express.Router();
 
@@ -64,6 +65,34 @@ router.post('/shopify/orders', verifyShopifyWebhook, async (req, res, next) => {
         phone: orderData.customer.phone,
         email: orderData.customer.email,
         address: orderData.shipping_address
+          ? {
+              street: [
+                orderData.shipping_address.address1,
+                orderData.shipping_address.address2
+              ]
+                .filter(Boolean)
+                .join(' ')
+                .trim(),
+
+              city:
+                orderData.shipping_address.city ||
+                '',
+
+              state:
+                orderData.shipping_address.province ||
+                orderData.shipping_address.province_code ||
+                '',
+
+              zipCode:
+                orderData.shipping_address.zip ||
+                '',
+
+              country:
+                orderData.shipping_address.country ||
+                orderData.shipping_address.country_code ||
+                ''
+            }
+          : undefined
       },
       items: orderData.line_items.map(item => ({
         name: item.name,
@@ -74,6 +103,7 @@ router.post('/shopify/orders', verifyShopifyWebhook, async (req, res, next) => {
       totalAmount: parseFloat(orderData.total_price)
     });
 
+    await aiScoringService.enrichOrder(order);
     await order.save();
 
     // Add to call queue if Redis is available

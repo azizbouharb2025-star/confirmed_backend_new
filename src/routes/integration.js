@@ -9,6 +9,7 @@ const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
 const shopIntegrationService = require('../services/shopIntegrationService');
 const productService = require('../services/productService');
+const aiScoringService = require('../services/aiScoringService');
 
 const router = express.Router();
 
@@ -1431,38 +1432,65 @@ router.get('/shop/:shopId/orders', authenticateApiKey, async (req, res) => {
   try {
     const { shopId } = req.params;
     const { page = 1, limit = 50, status } = req.query;
-    
+
     const query = { shopId };
-    if (status) query.status = status;
-    
+
+    if (status) {
+      query.status = status;
+    }
+
     const orders = await Order.find(query)
-      .populate('productId', 'name price imageUrl')
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
+      .populate(
+        'items.productId',
+        'name price imageUrl'
+      )
+      .limit(Number(limit))
+      .skip((Number(page) - 1) * Number(limit))
       .sort({ createdAt: -1 });
-    
-    const total = await Order.countDocuments(query);
-    
+
+    const total =
+      await Order.countDocuments(query);
+
     res.json({
-      orders: orders.map(o => ({
-        id: o._id,
-        customerName: o.customerName,
-        customerPhone: o.customerPhone,
-        product: o.productId,
-        quantity: o.quantity,
-        totalAmount: o.totalAmount,
-        status: o.status,
-        createdAt: o.createdAt
-      })),
+      orders: orders.map(order => {
+        const firstItem =
+          order.items?.[0];
+
+        return {
+          id: order._id,
+          customerName:
+            order.clientInfo?.name || '',
+          customerPhone:
+            order.clientInfo?.phone || '',
+          product:
+            firstItem?.productId || null,
+          quantity:
+            firstItem?.quantity || 0,
+          totalAmount:
+            order.totalAmount,
+          status:
+            order.status,
+          aiScore:
+            order.aiScore,
+          createdAt:
+            order.createdAt
+        };
+      }),
+
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: Number(page),
+        limit: Number(limit),
         total,
-        pages: Math.ceil(total / limit)
+        pages:
+          Math.ceil(
+            total / Number(limit)
+          )
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      error: error.message
+    });
   }
 });
 
@@ -1470,40 +1498,128 @@ router.get('/shop/:shopId/orders', authenticateApiKey, async (req, res) => {
 router.post('/shop/:shopId/orders', authenticateApiKey, async (req, res) => {
   try {
     const { shopId } = req.params;
-    const { customerName, customerPhone, productId, quantity, totalAmount } = req.body;
-    
-    if (!customerName || !customerPhone || !productId || !quantity) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-    
-    const order = new Order({
-      shopId,
+
+    const {
       customerName,
       customerPhone,
       productId,
       quantity,
-      totalAmount: totalAmount || 0,
+      totalAmount
+    } = req.body;
+
+    if (
+      !customerName ||
+      !customerPhone ||
+      !productId ||
+      !quantity
+    ) {
+      return res.status(400).json({
+        error: 'Missing required fields'
+      });
+    }
+
+    const product =
+      await Product.findOne({
+        _id: productId,
+        shopId
+      });
+
+    if (!product) {
+      return res.status(404).json({
+        error:
+          'Product not found for this shop'
+      });
+    }
+
+    const normalizedQuantity =
+      Math.max(
+        1,
+        Number(quantity) || 1
+      );
+
+    const suppliedTotal =
+      Number(totalAmount);
+
+    const normalizedTotal =
+      Number.isFinite(suppliedTotal) &&
+      suppliedTotal >= 0
+        ? suppliedTotal
+        : Number(
+            (
+              Number(product.price || 0) *
+              normalizedQuantity
+            ).toFixed(3)
+          );
+
+    const order = new Order({
+      shopId,
+
+      clientInfo: {
+        name: customerName,
+        phone: customerPhone
+      },
+
+      items: [{
+        productId: product._id,
+        name: product.name,
+        quantity: normalizedQuantity,
+        price: Number(product.price || 0),
+        sku: product.sku,
+        url:
+          product.productLink ||
+          undefined
+      }],
+
+      totalAmount: normalizedTotal,
       status: 'pending'
     });
-    
+
+    await aiScoringService.enrichOrder(order);
     await order.save();
-    await order.populate('productId', 'name price imageUrl');
-    
+
+    await order.populate(
+      'items.productId',
+      'name price imageUrl'
+    );
+
+    const firstItem =
+      order.items?.[0];
+
     res.status(201).json({
-      message: 'Order created successfully',
+      message:
+        'Order created successfully',
+
       order: {
         id: order._id,
-        customerName: order.customerName,
-        customerPhone: order.customerPhone,
-        product: order.productId,
-        quantity: order.quantity,
-        totalAmount: order.totalAmount,
-        status: order.status
+
+        customerName:
+          order.clientInfo?.name || '',
+
+        customerPhone:
+          order.clientInfo?.phone || '',
+
+        product:
+          firstItem?.productId || null,
+
+        quantity:
+          firstItem?.quantity || 0,
+
+        totalAmount:
+          order.totalAmount,
+
+        status:
+          order.status,
+
+        aiScore:
+          order.aiScore
       }
     });
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    res.status(400).json({
+      error: error.message
+    });
   }
 });
+
 
 module.exports = router;

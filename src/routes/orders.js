@@ -211,6 +211,7 @@ const operatorConfirmationSchema = Joi.object({
 
   receptionIntent: Joi.string()
     .valid(
+      'no_information',
       'wants_fast_delivery',
       'clearly_confirms_receipt',
       'asks_delivery_info',

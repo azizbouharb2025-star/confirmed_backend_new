@@ -5,6 +5,7 @@ const Product = require('../models/Product');
 const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
 const productService = require('./productService');
+const aiScoringService = require('./aiScoringService');
 
 const CONVERTY_TOKEN_URL =
   'https://partner.converty.shop/oauth2/token';
@@ -74,11 +75,44 @@ class ShopIntegrationService {
             clientInfo: {
               name: `${orderData.customer.first_name} ${orderData.customer.last_name}`,
               phone: orderData.customer.phone,
-              email: orderData.customer.email
+              email: orderData.customer.email,
+
+              address:
+                orderData.shipping_address
+                  ? {
+                      street: [
+                        orderData.shipping_address.address1,
+                        orderData.shipping_address.address2
+                      ]
+                        .filter(Boolean)
+                        .join(' ')
+                        .trim(),
+
+                      city:
+                        orderData.shipping_address.city ||
+                        '',
+
+                      state:
+                        orderData.shipping_address.province ||
+                        orderData.shipping_address.province_code ||
+                        '',
+
+                      zipCode:
+                        orderData.shipping_address.zip ||
+                        '',
+
+                      country:
+                        orderData.shipping_address.country ||
+                        orderData.shipping_address.country_code ||
+                        ''
+                    }
+                  : undefined
             },
             items,
             totalAmount: parseFloat(orderData.total_price)
           });
+
+          await aiScoringService.enrichOrder(order);
 
           await order.save();
 
@@ -141,11 +175,49 @@ class ShopIntegrationService {
             clientInfo: {
               name: `${orderData.billing.first_name} ${orderData.billing.last_name}`,
               phone: orderData.billing.phone,
-              email: orderData.billing.email
+              email: orderData.billing.email,
+
+              address:
+                orderData.shipping || orderData.billing
+                  ? {
+                      street: [
+                        orderData.shipping?.address_1 ||
+                          orderData.billing?.address_1,
+
+                        orderData.shipping?.address_2 ||
+                          orderData.billing?.address_2
+                      ]
+                        .filter(Boolean)
+                        .join(' ')
+                        .trim(),
+
+                      city:
+                        orderData.shipping?.city ||
+                        orderData.billing?.city ||
+                        '',
+
+                      state:
+                        orderData.shipping?.state ||
+                        orderData.billing?.state ||
+                        '',
+
+                      zipCode:
+                        orderData.shipping?.postcode ||
+                        orderData.billing?.postcode ||
+                        '',
+
+                      country:
+                        orderData.shipping?.country ||
+                        orderData.billing?.country ||
+                        ''
+                    }
+                  : undefined
             },
             items,
             totalAmount: parseFloat(orderData.total)
           });
+
+          await aiScoringService.enrichOrder(order);
 
           await order.save();
 
@@ -1180,6 +1252,8 @@ class ShopIntegrationService {
 
             totalAmount
           });
+
+        await aiScoringService.enrichOrder(order);
 
         await order.save();
 

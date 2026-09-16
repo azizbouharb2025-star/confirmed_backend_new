@@ -18,7 +18,7 @@ class OrderService {
     const order = new Order(orderData);
 
     // Calculate and persist the AI score for every new order.
-    aiScoringService.enrichOrder(order);
+    await aiScoringService.enrichOrder(order);
 
     await order.save();
 
@@ -1129,7 +1129,7 @@ class OrderService {
      * pondération comportementale : on déclenche donc
      * son recalcul existant sans inventer de coefficients.
      */
-    aiScoringService.enrichOrder(order);
+    await aiScoringService.enrichOrder(order);
 
     await order.save();
 

@@ -351,6 +351,7 @@ const orderSchema = new mongoose.Schema({
     receptionIntent: {
       type: String,
       enum: [
+        'no_information',
         'wants_fast_delivery',
         'clearly_confirms_receipt',
         'asks_delivery_info',
