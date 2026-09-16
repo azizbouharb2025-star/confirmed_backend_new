@@ -164,6 +164,29 @@ class AIScoringService {
       customerHistory: {
         successfulDeliveries: 0,
         failedDeliveries: 0
+      },
+
+      orderValueHistory: {
+        orderCount: 0,
+        averageOrderValue: null
+      },
+
+      regionHistory: {
+        region: '',
+        completedDeliveries: 0,
+        deliveredOrders: 0,
+        failedDeliveries: 0,
+        deliverySuccessRate: null
+      },
+
+      orderTimeHistory: {
+        hour: null,
+        sameHourCompleted: 0,
+        sameHourFailed: 0,
+        sameHourFailureRate: null,
+        overallCompleted: 0,
+        overallFailed: 0,
+        overallFailureRate: null
       }
     };
 
@@ -172,47 +195,306 @@ class AIScoringService {
         ? order.clientInfo.phone.trim()
         : '';
 
-    const shopId = order.shopId;
+    const shopId =
+      order.shopId?._id ||
+      order.shopId;
 
-    if (!phone || !shopId) {
+    if (!shopId) {
       return context;
     }
 
-    const customerQuery = {
-      shopId,
-      'clientInfo.phone': phone
+    /*
+     * La commande courante ne doit jamais compter
+     * dans son propre historique.
+     */
+    const baseShopQuery = {
+      shopId
     };
 
-    /*
-     * Lors d'un recalcul après confirmation,
-     * la commande existe déjà en base.
-     * Elle ne doit pas compter dans son propre historique.
-     */
     if (order._id) {
-      customerQuery._id = {
+      baseShopQuery._id = {
         $ne: order._id
       };
     }
 
-    const [
-      successfulDeliveries,
-      failedDeliveries
-    ] = await Promise.all([
-      Order.countDocuments({
-        ...customerQuery,
-        status: 'delivered'
-      }),
+    // ======================================================
+    // HISTORIQUE CLIENT + HABITUDES DE MONTANT
+    // ======================================================
 
-      Order.countDocuments({
-        ...customerQuery,
-        status: 'failed_delivery'
-      })
-    ]);
+    if (phone) {
+      const customerQuery = {
+        ...baseShopQuery,
+        'clientInfo.phone': phone
+      };
 
-    context.customerHistory = {
-      successfulDeliveries,
-      failedDeliveries
-    };
+      const [
+        successfulDeliveries,
+        failedDeliveries,
+        valueStats
+      ] = await Promise.all([
+        Order.countDocuments({
+          ...customerQuery,
+          status: 'delivered'
+        }),
+
+        Order.countDocuments({
+          ...customerQuery,
+          status: 'failed_delivery'
+        }),
+
+        Order.aggregate([
+          {
+            $match: customerQuery
+          },
+          {
+            $group: {
+              _id: null,
+              orderCount: {
+                $sum: 1
+              },
+              averageOrderValue: {
+                $avg: '$totalAmount'
+              }
+            }
+          }
+        ])
+      ]);
+
+      context.customerHistory = {
+        successfulDeliveries,
+        failedDeliveries
+      };
+
+      const valueHistory =
+        valueStats[0] || null;
+
+      context.orderValueHistory = {
+        orderCount:
+          valueHistory?.orderCount || 0,
+
+        averageOrderValue:
+          valueHistory?.averageOrderValue != null
+            ? Number(
+                valueHistory.averageOrderValue.toFixed(2)
+              )
+            : null
+      };
+    }
+
+    // ======================================================
+    // HISTORIQUE DE ZONE
+    // ======================================================
+
+    const regionName = String(
+      order.region ||
+      order.clientInfo?.address?.state ||
+      order.clientInfo?.address?.city ||
+      ''
+    ).trim();
+
+    if (regionName) {
+      const escapedRegion =
+        regionName.replace(
+          /[.*+?^${}()|[\]\\]/g,
+          '\\$&'
+        );
+
+      const regionRegex =
+        new RegExp(
+          `^${escapedRegion}$`,
+          'i'
+        );
+
+      const regionQuery = {
+        ...baseShopQuery,
+
+        $or: [
+          {
+            region: regionRegex
+          },
+          {
+            'clientInfo.address.state':
+              regionRegex
+          },
+          {
+            'clientInfo.address.city':
+              regionRegex
+          }
+        ]
+      };
+
+      const [
+        deliveredOrders,
+        failedDeliveries
+      ] = await Promise.all([
+        Order.countDocuments({
+          ...regionQuery,
+          status: 'delivered'
+        }),
+
+        Order.countDocuments({
+          ...regionQuery,
+          status: 'failed_delivery'
+        })
+      ]);
+
+      const completedDeliveries =
+        deliveredOrders +
+        failedDeliveries;
+
+      const deliverySuccessRate =
+        completedDeliveries > 0
+          ? Number(
+              (
+                (
+                  deliveredOrders /
+                  completedDeliveries
+                ) * 100
+              ).toFixed(1)
+            )
+          : null;
+
+      context.regionHistory = {
+        region: regionName,
+        completedDeliveries,
+        deliveredOrders,
+        failedDeliveries,
+        deliverySuccessRate
+      };
+    }
+
+    // ======================================================
+    // HISTORIQUE HORAIRE
+    // ======================================================
+
+    const currentHour =
+      this.getTunisiaOrderHour(order);
+
+    if (currentHour !== null) {
+      const completedQuery = {
+        ...baseShopQuery,
+
+        status: {
+          $in: [
+            'delivered',
+            'failed_delivery'
+          ]
+        }
+      };
+
+      const [
+        overallDelivered,
+        overallFailed,
+        sameHourStats
+      ] = await Promise.all([
+        Order.countDocuments({
+          ...baseShopQuery,
+          status: 'delivered'
+        }),
+
+        Order.countDocuments({
+          ...baseShopQuery,
+          status: 'failed_delivery'
+        }),
+
+        Order.aggregate([
+          {
+            $match: completedQuery
+          },
+
+          {
+            $project: {
+              status: 1,
+
+              localHour: {
+                $hour: {
+                  date: '$createdAt',
+                  timezone: 'Africa/Tunis'
+                }
+              }
+            }
+          },
+
+          {
+            $match: {
+              localHour: currentHour
+            }
+          },
+
+          {
+            $group: {
+              _id: null,
+
+              completed: {
+                $sum: 1
+              },
+
+              failed: {
+                $sum: {
+                  $cond: [
+                    {
+                      $eq: [
+                        '$status',
+                        'failed_delivery'
+                      ]
+                    },
+                    1,
+                    0
+                  ]
+                }
+              }
+            }
+          }
+        ])
+      ]);
+
+      const overallCompleted =
+        overallDelivered +
+        overallFailed;
+
+      const overallFailureRate =
+        overallCompleted > 0
+          ? Number(
+              (
+                (
+                  overallFailed /
+                  overallCompleted
+                ) * 100
+              ).toFixed(1)
+            )
+          : null;
+
+      const hourStats =
+        sameHourStats[0] || null;
+
+      const sameHourCompleted =
+        hourStats?.completed || 0;
+
+      const sameHourFailed =
+        hourStats?.failed || 0;
+
+      const sameHourFailureRate =
+        sameHourCompleted > 0
+          ? Number(
+              (
+                (
+                  sameHourFailed /
+                  sameHourCompleted
+                ) * 100
+              ).toFixed(1)
+            )
+          : null;
+
+      context.orderTimeHistory = {
+        hour: currentHour,
+        sameHourCompleted,
+        sameHourFailed,
+        sameHourFailureRate,
+        overallCompleted,
+        overallFailed,
+        overallFailureRate
+      };
+    }
 
     return context;
   }
@@ -400,6 +682,207 @@ class AIScoringService {
   }
 
   /**
+   * Zone géographique historique.
+   *
+   * Convention V1 :
+   * moins de 20 livraisons terminées = historique insuffisant.
+   */
+  calculateRegionHistoryAdjustment(history) {
+    const completed =
+      Number(
+        history?.completedDeliveries
+      ) || 0;
+
+    const successRate =
+      Number(
+        history?.deliverySuccessRate
+      );
+
+    if (
+      completed < 20 ||
+      !Number.isFinite(successRate)
+    ) {
+      return {
+        adjustment: 0,
+        state: 'insufficient'
+      };
+    }
+
+    if (successRate >= 90) {
+      return {
+        adjustment: 5,
+        state: 'excellent'
+      };
+    }
+
+    if (successRate >= 80) {
+      return {
+        adjustment: 3,
+        state: 'good'
+      };
+    }
+
+    if (successRate >= 65) {
+      return {
+        adjustment: 0,
+        state: 'medium'
+      };
+    }
+
+    if (successRate >= 50) {
+      return {
+        adjustment: -4,
+        state: 'weak'
+      };
+    }
+
+    return {
+      adjustment: -7,
+      state: 'very_weak'
+    };
+  }
+
+  /**
+   * Montant relatif aux habitudes du client.
+   *
+   * Convention V1 :
+   * minimum 3 commandes historiques.
+   */
+  calculateOrderAmountHistoryAdjustment(
+    amount,
+    history
+  ) {
+    const orderCount =
+      Number(
+        history?.orderCount
+      ) || 0;
+
+    const average =
+      Number(
+        history?.averageOrderValue
+      );
+
+    const current =
+      Number(amount);
+
+    if (
+      orderCount < 3 ||
+      !Number.isFinite(average) ||
+      average <= 0 ||
+      !Number.isFinite(current)
+    ) {
+      return {
+        adjustment: 0,
+        state: 'insufficient',
+        ratio: null
+      };
+    }
+
+    const ratio =
+      current / average;
+
+    if (ratio < 0.5) {
+      return {
+        adjustment: -1,
+        state: 'very_low',
+        ratio
+      };
+    }
+
+    if (ratio <= 1.25) {
+      return {
+        adjustment: 0,
+        state: 'normal',
+        ratio
+      };
+    }
+
+    if (ratio <= 1.5) {
+      return {
+        adjustment: -1,
+        state: 'slightly_above',
+        ratio
+      };
+    }
+
+    if (ratio <= 2) {
+      return {
+        adjustment: -3,
+        state: 'high',
+        ratio
+      };
+    }
+
+    return {
+      adjustment: -5,
+      state: 'very_high',
+      ratio
+    };
+  }
+
+  /**
+   * Historique horaire des échecs de livraison.
+   *
+   * Convention V1 :
+   * - minimum 5 livraisons terminées à cette heure ;
+   * - taux d'échec >= 30 % ;
+   * - au moins 15 points au-dessus du taux global
+   *   de la boutique.
+   */
+  calculateOrderTimeHistoryAdjustment(
+    history
+  ) {
+    const sameHourCompleted =
+      Number(
+        history?.sameHourCompleted
+      ) || 0;
+
+    const sameHourFailureRate =
+      Number(
+        history?.sameHourFailureRate
+      );
+
+    const overallFailureRate =
+      Number(
+        history?.overallFailureRate
+      );
+
+    if (
+      sameHourCompleted < 5 ||
+      !Number.isFinite(
+        sameHourFailureRate
+      ) ||
+      !Number.isFinite(
+        overallFailureRate
+      )
+    ) {
+      return {
+        adjustment: 0,
+        state: 'insufficient'
+      };
+    }
+
+    const excessFailureRate =
+      sameHourFailureRate -
+      overallFailureRate;
+
+    if (
+      sameHourFailureRate >= 30 &&
+      excessFailureRate >= 15
+    ) {
+      return {
+        adjustment: -3,
+        state: 'historically_risky'
+      };
+    }
+
+    return {
+      adjustment: 0,
+      state: 'normal'
+    };
+  }
+
+  /**
    * Calculate AI score according to Scoring IA PDF.
    *
    * Base     : 65
@@ -432,21 +915,27 @@ class AIScoringService {
     // 2. ZONE GEOGRAPHIQUE
     // =====================================================
 
-    /*
-     * V1 du PDF :
-     * aucune ville / aucun gouvernorat ne reçoit
-     * de bonus ou pénalité fixe.
-     */
+    const regionHistory =
+      this.calculateRegionHistoryAdjustment(
+        context.regionHistory
+      );
+
+    score +=
+      regionHistory.adjustment;
+
     factors.push({
       key: 'region',
       label: 'Zone géographique',
       value:
+        context.regionHistory?.region ||
         order.region ||
         order.clientInfo?.address?.state ||
         order.clientInfo?.address?.city ||
         '',
-      impact: 0,
-      applied: false
+      impact:
+        regionHistory.adjustment,
+      applied:
+        regionHistory.adjustment !== 0
     });
 
     // =====================================================
@@ -468,17 +957,28 @@ class AIScoringService {
       applied: amountAdjustment !== 0
     });
 
-    /*
-     * Comparaison historique du montant :
-     * neutralisée tant que les seuils métier ne sont
-     * pas définis dans le cahier des charges.
-     */
+    const amountHistory =
+      this.calculateOrderAmountHistoryAdjustment(
+        order.totalAmount,
+        context.orderValueHistory
+      );
+
+    score +=
+      amountHistory.adjustment;
+
     factors.push({
       key: 'order_amount_history',
       label: 'Valeur par rapport aux commandes habituelles',
-      value: 'Seuils non définis',
-      impact: 0,
-      applied: false
+      value:
+        amountHistory.ratio === null
+          ? amountHistory.state
+          : `${Math.round(
+              amountHistory.ratio * 100
+            )}% de la moyenne client`,
+      impact:
+        amountHistory.adjustment,
+      applied:
+        amountHistory.adjustment !== 0
     });
 
     // =====================================================
@@ -488,7 +988,35 @@ class AIScoringService {
     const timeResult =
       this.calculateOrderTimeAdjustment(order);
 
-    score += timeResult.adjustment;
+    const timeHistory =
+      this.calculateOrderTimeHistoryAdjustment(
+        context.orderTimeHistory
+      );
+
+    /*
+     * Les deux signaux évaluent le même critère horaire.
+     * On applique uniquement la pénalité la plus forte,
+     * afin de ne pas compter deux fois le même risque.
+     */
+    const historicalTimeIsStronger =
+      timeHistory.adjustment <
+      timeResult.adjustment;
+
+    const fixedTimeImpact =
+      historicalTimeIsStronger
+        ? 0
+        : timeResult.adjustment;
+
+    const historicalTimeImpact =
+      historicalTimeIsStronger
+        ? timeHistory.adjustment
+        : 0;
+
+    score +=
+      Math.min(
+        timeResult.adjustment,
+        timeHistory.adjustment
+      );
 
     factors.push({
       key: 'order_time',
@@ -496,23 +1024,21 @@ class AIScoringService {
       value:
         timeResult.hour === null
           ? null
-          : `${String(timeResult.hour).padStart(2, '0')}:00`,
-      impact: timeResult.adjustment,
-      applied: timeResult.adjustment !== 0
+          : `${String(
+              timeResult.hour
+            ).padStart(2, '0')}:00`,
+      impact: fixedTimeImpact,
+      applied:
+        fixedTimeImpact !== 0
     });
 
-    /*
-     * Le PDF mentionne également les horaires
-     * historiquement associés à plus d'échecs.
-     * Aucun seuil statistique n'étant défini,
-     * ce sous-signal reste neutre.
-     */
     factors.push({
       key: 'order_time_history',
       label: 'Historique de l’heure de commande',
-      value: 'Seuil statistique non défini',
-      impact: 0,
-      applied: false
+      value: timeHistory.state,
+      impact: historicalTimeImpact,
+      applied:
+        historicalTimeImpact !== 0
     });
 
     // =====================================================
