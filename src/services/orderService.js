@@ -106,8 +106,21 @@ class OrderService {
     }
 
 
-    // Status filter
-    if (status) {
+    /*
+     * AI filters are always based directly on aiScore.
+     * When an AI filter is used, only confirmed orders
+     * participate in the selection.
+     */
+    const hasAiFilter =
+      aiScoreMin !== undefined ||
+      aiScoreMax !== undefined ||
+      ['accept', 'review', 'reject'].includes(aiDecision) ||
+      ['critical', 'high', 'medium', 'low', 'very_low'].includes(riskLevel) ||
+      filter === 'risky';
+
+    if (hasAiFilter) {
+      query.status = 'confirmed';
+    } else if (status) {
       query.status = status;
     }
 
@@ -122,30 +135,79 @@ class OrderService {
       }
     }
 
-    // Pro tier filters - AI score range
-    if (aiScoreMin !== undefined || aiScoreMax !== undefined) {
-      query.aiScore = {};
-      if (aiScoreMin !== undefined) {
-        query.aiScore.$gte = Number(aiScoreMin);
+    /*
+     * Build one non-overlapping aiScore query.
+     * Multiple AI filters intersect cleanly.
+     */
+    const aiScoreBounds = {};
+
+    const applyMin = value => {
+      const number = Number(value);
+
+      if (!Number.isFinite(number)) {
+        return;
       }
-      if (aiScoreMax !== undefined) {
-        query.aiScore.$lte = Number(aiScoreMax);
+
+      aiScoreBounds.$gte =
+        aiScoreBounds.$gte === undefined
+          ? number
+          : Math.max(aiScoreBounds.$gte, number);
+    };
+
+    const applyMax = value => {
+      const number = Number(value);
+
+      if (!Number.isFinite(number)) {
+        return;
       }
+
+      aiScoreBounds.$lte =
+        aiScoreBounds.$lte === undefined
+          ? number
+          : Math.min(aiScoreBounds.$lte, number);
+    };
+
+    if (aiScoreMin !== undefined) {
+      applyMin(aiScoreMin);
     }
 
-    // AI decision filter
-    if (['accept', 'review', 'reject'].includes(aiDecision)) {
-      query.aiDecision = aiDecision;
+    if (aiScoreMax !== undefined) {
+      applyMax(aiScoreMax);
     }
 
-    // AI risk level filter
-    if (['critical', 'high', 'medium', 'low', 'very_low'].includes(riskLevel)) {
-      query.riskLevel = riskLevel;
+    // Décision IA from score.
+    if (aiDecision === 'accept') {
+      applyMin(75);
+    } else if (aiDecision === 'review') {
+      applyMin(61);
+      applyMax(74);
+    } else if (aiDecision === 'reject') {
+      applyMax(59);
     }
 
-    // Special filter for risky orders
+    // Niveau de risque from score.
+    if (riskLevel === 'very_low') {
+      applyMin(90);
+      applyMax(100);
+    } else if (riskLevel === 'low') {
+      applyMin(80);
+      applyMax(89);
+    } else if (riskLevel === 'medium') {
+      applyMin(70);
+      applyMax(79);
+    } else if (riskLevel === 'high') {
+      applyMin(60);
+      applyMax(69);
+    } else if (riskLevel === 'critical') {
+      applyMax(59);
+    }
+
     if (filter === 'risky') {
-      query.aiScore = { $lt: 50 };
+      applyMax(49);
+    }
+
+    if (Object.keys(aiScoreBounds).length > 0) {
+      query.aiScore = aiScoreBounds;
     }
 
     // Business tier filters

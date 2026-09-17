@@ -1444,6 +1444,21 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
     const normalizedProvider = String(provider).toLowerCase().trim();
     const normalizedFileType = String(fileType).toLowerCase().trim();
 
+    /*
+     * A logistics export always works from the explicit
+     * selection. Empty selection must never mean
+     * "export every order in the shop".
+     */
+    if (
+      !Array.isArray(orderIds) ||
+      orderIds.length === 0
+    ) {
+      return res.status(400).json({
+        error:
+          'Select at least one order before exporting'
+      });
+    }
+
     const logLogisticsExport = async () => {
       const { logActivity } = require('../services/activityLogService');
 
@@ -1475,6 +1490,50 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       );
     };
 
+    const finalizeSuccessfulLogisticsExport =
+      async () => {
+        /*
+         * Re-read the exported orders inside the
+         * authenticated shop scope.
+         */
+        const exportedOrders =
+          await exportService.fetchOrdersForExport(
+            orderIds,
+            req.user
+          );
+
+        const confirmedIds =
+          exportedOrders
+            .filter(
+              order =>
+                order.status === 'confirmed'
+            )
+            .map(order =>
+              String(order._id)
+            );
+
+        if (confirmedIds.length > 0) {
+          const result =
+            await orderService.bulkUpdateStatus(
+              confirmedIds,
+              'shipped',
+              req.user
+            );
+
+          if (result.failed > 0) {
+            const error = new Error(
+              'Export generated but status update failed'
+            );
+
+            error.statusCode = 500;
+            error.details = result.errors;
+            throw error;
+          }
+        }
+
+        await logLogisticsExport()
+      };
+
     if (!['csv', 'xlsx'].includes(normalizedFileType)) {
       return res.status(400).json({ error: 'fileType must be "csv" or "xlsx"' });
     }
@@ -1488,7 +1547,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       if (normalizedFileType === 'csv') {
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        await logLogisticsExport();
+        await finalizeSuccessfulLogisticsExport();
         return res.send(csv);
       }
       // XLSX for generic: convert CSV to XLSX via SheetJS
@@ -1503,7 +1562,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      await logLogisticsExport();
+      await finalizeSuccessfulLogisticsExport();
       return res.send(buf);
     }
 
@@ -1515,7 +1574,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportIntigoCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="intigo-export.csv"');
-        await logLogisticsExport();
+        await finalizeSuccessfulLogisticsExport();
         return res.send(csv);
       }
 
@@ -1523,7 +1582,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportIntigoXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="intigo-export.xlsx"');
-      await logLogisticsExport();
+      await finalizeSuccessfulLogisticsExport();
       return res.send(buf);
     }
 
@@ -1535,7 +1594,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportColissimoCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="colissimo-export.csv"');
-        await logLogisticsExport();
+        await finalizeSuccessfulLogisticsExport();
         return res.send(csv);
       }
 
@@ -1548,7 +1607,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         'Content-Disposition',
         'attachment; filename="colissimo-export.xlsx"'
       );
-      await logLogisticsExport();
+      await finalizeSuccessfulLogisticsExport();
       return res.send(buf);
     }
 
@@ -1560,7 +1619,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportAramexCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="aramex-export.csv"');
-        await logLogisticsExport();
+        await finalizeSuccessfulLogisticsExport();
         return res.send(csv);
       }
 
@@ -1568,7 +1627,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportAramexXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="aramex-export.xlsx"');
-      await logLogisticsExport();
+      await finalizeSuccessfulLogisticsExport();
       return res.send(buf);
     }
 
@@ -1580,7 +1639,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportRapidPosteCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="rapid-poste-export.csv"');
-        await logLogisticsExport();
+        await finalizeSuccessfulLogisticsExport();
         return res.send(csv);
       }
 
@@ -1588,7 +1647,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportRapidPosteXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="rapid-poste-export.xlsx"');
-      await logLogisticsExport();
+      await finalizeSuccessfulLogisticsExport();
       return res.send(buf);
     }
 
@@ -1600,7 +1659,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportYalidineCSV(ids, req.user);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="yalidine-export.csv"');
-        await logLogisticsExport();
+        await finalizeSuccessfulLogisticsExport();
         return res.send(csv);
       }
 
@@ -1608,7 +1667,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportYalidineXLSX(ids, req.user);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="yalidine-export.xlsx"');
-      await logLogisticsExport();
+      await finalizeSuccessfulLogisticsExport();
       return res.send(buf);
     }
 
@@ -1627,7 +1686,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
         const csv = await exportService.exportCustomCSV(ids, req.user, columns);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename="custom-export.csv"');
-        await logLogisticsExport();
+        await finalizeSuccessfulLogisticsExport();
         return res.send(csv);
       }
 
@@ -1635,7 +1694,7 @@ router.post('/export/logistics', auth, authorize('shop_owner'), async (req, res,
       const buf = await exportService.exportCustomXLSX(ids, req.user, columns);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', 'attachment; filename="custom-export.xlsx"');
-      await logLogisticsExport();
+      await finalizeSuccessfulLogisticsExport();
       return res.send(buf);
     }
 

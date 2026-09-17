@@ -57,15 +57,41 @@ class ExportService {
    */
   async exportOrdersToCSV(filters = {}, user = {}) {
     try {
-      // Remove pagination limits for export - get all matching orders
+      const {
+        orderIds,
+        ...queryFilters
+      } = filters;
+
+      // Remove pagination limits for export.
       const exportFilters = {
-        ...filters,
+        ...queryFilters,
         page: 1,
-        limit: 10000 // High limit to get all orders
+        limit: 10000
       };
 
-      const result = await orderService.findOrders(exportFilters, user);
-      const orders = result.orders;
+      const result =
+        await orderService.findOrders(
+          exportFilters,
+          user
+        );
+
+      let orders = result.orders;
+
+      /*
+       * Logistics export must contain only explicitly
+       * selected orders when IDs are supplied.
+       */
+      if (
+        Array.isArray(orderIds) &&
+        orderIds.length > 0
+      ) {
+        const selectedIds =
+          new Set(orderIds.map(String));
+
+        orders = orders.filter(order =>
+          selectedIds.has(String(order._id))
+        );
+      }
 
       // Build CSV content
       const rows = [];
