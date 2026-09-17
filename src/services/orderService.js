@@ -2308,22 +2308,51 @@ class OrderService {
       throw error;
     }
 
-    // Update status
+    /*
+     * Non-admin accounts may only update orders
+     * belonging to their own shop.
+     */
+    if (user.role !== 'admin') {
+      if (
+        !user.shopId ||
+        !order.shopId ||
+        order.shopId.toString() !==
+          user.shopId.toString()
+      ) {
+        const error =
+          new Error('Access denied');
+        error.statusCode = 403;
+        throw error;
+      }
+    }
+
+    const previousStatus = order.status;
+
+    /*
+     * A status change is not a phone call.
+     * callHistory must contain real contact attempts only.
+     */
     order.status = status;
 
-    // Add call history entry
-    order.callHistory.push({
-      operatorId: user._id || user.id,
-      callType: 'human',
-      timestamp: new Date(),
-      result: status === 'confirmed' ? 'confirmed' : 
-              status === 'cancelled' ? 'rejected' : 'confirmed',
-      notes
-    });
+    if (previousStatus !== status) {
+      order.statusHistory.push({
+        status,
+        timestamp: new Date(),
+        operatorId:
+          user._id || user.id,
+        source:
+          user.role === 'operator'
+            ? 'operator'
+            : 'system',
+        reason:
+          `Statut modifié de ${previousStatus} vers ${status}`,
+        notes:
+          notes || undefined
+      });
+    }
 
     await order.save();
 
-    // Emit WebSocket event for real-time updates
     emitOrderUpdate(order);
 
     return order;

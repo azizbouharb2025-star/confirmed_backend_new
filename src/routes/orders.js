@@ -924,7 +924,7 @@ router.patch(
 
 /**
  * PATCH /api/orders/:id/status
- * Update order status and add call history entry
+ * Update order status and add status history entry
  * Requirements: 3.1, 3.2, 3.3
  */
 router.patch('/:id/status', auth, async (req, res, next) => {
@@ -949,9 +949,15 @@ router.patch('/:id/status', auth, async (req, res, next) => {
     
     res.json(order);
   } catch (error) {
-    if (error.statusCode === 404) {
-      return res.status(404).json({ error: error.message });
+    if (
+      error.statusCode === 403 ||
+      error.statusCode === 404
+    ) {
+      return res
+        .status(error.statusCode)
+        .json({ error: error.message });
     }
+
     next(error);
   }
 });
