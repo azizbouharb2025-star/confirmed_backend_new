@@ -1,3 +1,4 @@
+const { resolveTunisiaGovernorate } = require('../../utils/tunisiaGovernorateResolver');
 const MAX_DESCRIPTION_LENGTH = 500;
 
 const cleanString = value =>
@@ -72,6 +73,7 @@ const mapOrderToIntigo = order => {
   const address = order?.clientInfo?.address || {};
 
   const cityName = cleanString(
+    resolveTunisiaGovernorate(order) ||
     address.state ||
     order?.region ||
     address.city

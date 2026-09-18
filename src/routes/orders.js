@@ -1,4 +1,5 @@
 const express = require('express');
+const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 const Joi = require('joi');
 const multer = require('multer');
 const Order = require('../models/Order');
@@ -449,8 +450,20 @@ router.post('/', auth, authorize('shop_owner'), async (req, res, next) => {
     );
 
     const governorate =
-      manualOrderData.clientInfo?.address?.state?.trim() ||
+      resolveTunisiaGovernorate(
+        manualOrderData
+      ) ||
+      manualOrderData.clientInfo
+        ?.address?.state?.trim() ||
       '';
+
+    if (
+      governorate &&
+      manualOrderData.clientInfo?.address
+    ) {
+      manualOrderData.clientInfo.address.state =
+        governorate;
+    }
 
     const order = await orderService.createOrder({
       ...manualOrderData,
@@ -1838,7 +1851,11 @@ function generateDeliveryCSV(orders, courierName) {
     const address = order.clientInfo?.address;
     const street = address?.street || '';
     const city = address?.city || '';
-    const region = address?.state || order.region || '';
+    const region =
+      resolveTunisiaGovernorate(order) ||
+      address?.state ||
+      order.region ||
+      '';
     const zipCode = address?.zipCode || '';
     const amount = order.totalAmount || 0;
     const items = (order.items || []).map(i => `${i.name} x${i.quantity}`).join(' | ');

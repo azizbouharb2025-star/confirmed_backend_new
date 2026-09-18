@@ -1,4 +1,5 @@
 const Order = require('../models/Order');
+const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 
 class AIScoringService {
   /**
@@ -286,6 +287,7 @@ class AIScoringService {
     // ======================================================
 
     const regionName = String(
+      resolveTunisiaGovernorate(order) ||
       order.region ||
       order.clientInfo?.address?.state ||
       order.clientInfo?.address?.city ||
@@ -544,6 +546,7 @@ class AIScoringService {
     ).trim();
 
     const state = String(
+      resolveTunisiaGovernorate(order) ||
       address.state ||
       order.region ||
       ''
@@ -928,6 +931,7 @@ class AIScoringService {
       label: 'Zone géographique',
       value:
         context.regionHistory?.region ||
+        resolveTunisiaGovernorate(order) ||
         order.region ||
         order.clientInfo?.address?.state ||
         order.clientInfo?.address?.city ||
@@ -1171,7 +1175,12 @@ class AIScoringService {
 
     const street = (address.street || '').trim();
     const city = (address.city || '').trim();
-    const state = (address.state || order.region || '').trim();
+    const state = (
+      resolveTunisiaGovernorate(order) ||
+      address.state ||
+      order.region ||
+      ''
+    ).trim();
     const zipCode = (address.zipCode || '').trim();
 
     const findings = [];

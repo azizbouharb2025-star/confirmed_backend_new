@@ -1,4 +1,5 @@
 const Order = require('../models/Order');
+const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 const DeliveryShipment = require('../models/DeliveryShipment');
 const logger = require('../utils/logger');
 const { emitOrderUpdate, emitOrderNew, emitOrderDelete } = require('../websocket/orderEvents');
@@ -857,6 +858,7 @@ class OrderService {
     // CONFIRMED historical statistics for the order's geographical zone.
     // Aggregate statistics only: no customer or merchant details are exposed.
     const regionName = (
+      resolveTunisiaGovernorate(order) ||
       order.region ||
       order.clientInfo?.address?.state ||
       order.clientInfo?.address?.city ||
@@ -2191,8 +2193,27 @@ class OrderService {
          * historiques de CONFIRMED.
          * On le garde synchronisé avec le gouvernorat.
          */
-        if (client.address.state !== undefined) {
-          order.region = client.address.state;
+        const resolvedGovernorate =
+          resolveTunisiaGovernorate([
+            client.address.state,
+            client.address.city,
+            client.address.district,
+            client.address.street,
+            order.clientInfo?.address?.state,
+            order.region
+          ]);
+
+        if (resolvedGovernorate) {
+          order.clientInfo.address.state =
+            resolvedGovernorate;
+
+          order.region =
+            resolvedGovernorate;
+        } else if (
+          client.address.state !== undefined
+        ) {
+          order.region =
+            client.address.state;
         }
       }
     }

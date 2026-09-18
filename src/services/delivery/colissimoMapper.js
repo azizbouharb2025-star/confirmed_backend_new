@@ -1,3 +1,4 @@
+const { resolveTunisiaGovernorate } = require('../../utils/tunisiaGovernorateResolver');
 const COLISSIMO_GOVERNORATES = [
   'Ariana',
   'Beja',
@@ -169,10 +170,16 @@ const mapOrderToColissimo = (
   const address =
     order?.clientInfo?.address || {};
 
+  const detectedGovernorate =
+    resolveTunisiaGovernorate(order);
+
   const rawGovernorate =
     cleanString(
+      detectedGovernorate ||
       address.state ||
-      order?.region
+      order?.region ||
+      address.city ||
+      address.district
     );
 
   const governorate =

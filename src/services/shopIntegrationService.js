@@ -6,6 +6,7 @@ const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
 const productService = require('./productService');
 const aiScoringService = require('./aiScoringService');
+const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 
 const CONVERTY_TOKEN_URL =
   'https://partner.converty.shop/oauth2/token';
@@ -69,6 +70,18 @@ class ShopIntegrationService {
             };
           }));
 
+          const shopifyAddress =
+            orderData.shipping_address || {};
+
+          const shopifyGovernorate =
+            resolveTunisiaGovernorate([
+              shopifyAddress.province,
+              shopifyAddress.province_code,
+              shopifyAddress.city,
+              shopifyAddress.address1,
+              shopifyAddress.address2
+            ]);
+
           const order = new Order({
             orderId: orderData.id.toString(),
             shopId,
@@ -93,8 +106,9 @@ class ShopIntegrationService {
                         '',
 
                       state:
-                        orderData.shipping_address.province ||
-                        orderData.shipping_address.province_code ||
+                        shopifyGovernorate ||
+                        shopifyAddress.province ||
+                        shopifyAddress.province_code ||
                         '',
 
                       zipCode:
@@ -108,6 +122,13 @@ class ShopIntegrationService {
                     }
                   : undefined
             },
+
+            region:
+              shopifyGovernorate ||
+              shopifyAddress.province ||
+              shopifyAddress.province_code ||
+              '',
+
             items,
             totalAmount: parseFloat(orderData.total_price)
           });
@@ -169,6 +190,20 @@ class ShopIntegrationService {
             };
           }));
 
+          const wooAddress =
+            orderData.shipping ||
+            orderData.billing ||
+            {};
+
+          const wooGovernorate =
+            resolveTunisiaGovernorate([
+              orderData.shipping?.state,
+              orderData.billing?.state,
+              wooAddress.city,
+              wooAddress.address_1,
+              wooAddress.address_2
+            ]);
+
           const order = new Order({
             orderId: orderData.id.toString(),
             shopId,
@@ -197,6 +232,7 @@ class ShopIntegrationService {
                         '',
 
                       state:
+                        wooGovernorate ||
                         orderData.shipping?.state ||
                         orderData.billing?.state ||
                         '',
@@ -213,6 +249,13 @@ class ShopIntegrationService {
                     }
                   : undefined
             },
+
+            region:
+              wooGovernorate ||
+              orderData.shipping?.state ||
+              orderData.billing?.state ||
+              '',
+
             items,
             totalAmount: parseFloat(orderData.total)
           });
@@ -1026,6 +1069,12 @@ class ShopIntegrationService {
               source.customer.address;
           }
 
+          const existingOrderGovernorate =
+            resolveTunisiaGovernorate([
+              source?.customer?.city,
+              source?.customer?.address
+            ]);
+
           if (
             source?.customer?.city !==
               undefined &&
@@ -1036,14 +1085,16 @@ class ShopIntegrationService {
               'clientInfo.address.city'
             ] =
               source.customer.city;
+          }
 
+          if (existingOrderGovernorate) {
             syncedFields[
               'clientInfo.address.state'
             ] =
-              source.customer.city;
+              existingOrderGovernorate;
 
             syncedFields.region =
-              source.customer.city;
+              existingOrderGovernorate;
           }
 
           const normalizeItems =
@@ -1199,6 +1250,12 @@ class ShopIntegrationService {
           continue;
         }
 
+        const newOrderGovernorate =
+          resolveTunisiaGovernorate([
+            source?.customer?.city,
+            source?.customer?.address
+          ]);
+
         const order =
           new Order({
             shopId,
@@ -1232,14 +1289,14 @@ class ShopIntegrationService {
                         '',
 
                       state:
-                        source?.customer?.city ||
+                        newOrderGovernorate ||
                         ''
                     }
                   : undefined
             },
 
             region:
-              source?.customer?.city ||
+              newOrderGovernorate ||
               '',
 
             items,

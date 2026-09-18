@@ -1,6 +1,7 @@
 const orderService = require('./orderService');
 const logger = require('../utils/logger');
 const XLSX = require('xlsx');
+const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 
 /**
  * CSV field escaping - handles quotes, commas, and newlines
@@ -183,7 +184,7 @@ class ExportService {
       telephone2: '',
       adresse: address.street || '',
       // Intigo nomme ce champ "ville", mais il attend le Gouvernorat.
-      ville: address.state || order.region || '',
+      ville: resolveTunisiaGovernorate(order) || address.state || order.region || '',
       // Intigo attend ici la Délégation.
       district: address.district || '',
       quartier: '',
@@ -309,7 +310,7 @@ class ExportService {
 
     return {
       'Nom': order.clientInfo?.name || '',
-      'Gouvernerat': address.state || order.region || '',
+      'Gouvernerat': resolveTunisiaGovernorate(order) || address.state || order.region || '',
       'Ville': address.city || '',
       'Localité': address.district || '',
       'Adresse': address.street || '',
@@ -441,7 +442,7 @@ class ExportService {
    */
   static mapOrderToAramex(order) {
     const address = order.clientInfo?.address || {};
-    const gouvernorat = address.state || order.region || address.city || '';
+    const gouvernorat = resolveTunisiaGovernorate(order) || address.state || order.region || address.city || '';
     return {
       'Nom':         order.clientInfo?.name  || '',
       'Téléphone':   order.clientInfo?.phone || '',
@@ -523,7 +524,7 @@ class ExportService {
    */
   static mapOrderToRapidPoste(order) {
     const address = order.clientInfo?.address || {};
-    const gouvernorat = address.state || order.region || address.city || '';
+    const gouvernorat = resolveTunisiaGovernorate(order) || address.state || order.region || address.city || '';
     return {
       'N° Commande':       order.orderId                           || '',
       'Destinataire':      order.clientInfo?.name                  || '',
@@ -617,7 +618,7 @@ class ExportService {
   static mapOrderToYalidine(order) {
     const address  = order.clientInfo?.address || {};
     const tracking = order.deliveryInfo?.trackingNumber || order.orderId || '';
-    const wilaya   = address.state || order.region || '';
+    const wilaya   = resolveTunisiaGovernorate(order) || address.state || order.region || '';
     return {
       'Tracking':  tracking,
       'Nom':       order.clientInfo?.name  || '',
@@ -803,7 +804,7 @@ class ExportService {
       customerName: order.clientInfo?.name                          || '',
       phone:        order.clientInfo?.phone                         || '',
       address:      ExportService.buildAddress(address),
-      region:       address.state                                   || order.region || '',
+      region:       resolveTunisiaGovernorate(order) || address.state || order.region || '',
       city:         address.city                                    || '',
       product:      ExportService.formatItems(order.items),
       quantity:     totalQty,

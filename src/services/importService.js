@@ -2,6 +2,7 @@ const XLSX = require('xlsx');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../utils/logger');
 const aiScoringService = require('./aiScoringService');
+const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 
 /**
  * Column alias mappings for AI column detection.
@@ -550,6 +551,14 @@ function rowToOrderPayload(row, shopId) {
   const amount = parseFloat(row.totalAmount) || 0;
   const quantity = parseInt(row.quantity, 10) || 1;
   const price = amount / quantity || amount;
+
+  const governorate =
+    resolveTunisiaGovernorate([
+      row.region,
+      row.city,
+      row.district,
+      row.address
+    ]);
   
   return {
     orderId: row.orderId || `IMP-${uuidv4().slice(0, 8).toUpperCase()}`,
@@ -560,7 +569,7 @@ function rowToOrderPayload(row, shopId) {
       address: {
         street: row.address || '',
         city: row.city || '',
-        state: row.region || '',
+        state: governorate || row.region || '',
         district: row.district || '',
         zipCode: '',
         country: 'TN'
@@ -573,7 +582,7 @@ function rowToOrderPayload(row, shopId) {
       sku: ''
     }],
     totalAmount: amount,
-    region: row.region || '',
+    region: governorate || row.region || '',
     status: 'pending',
     priority: 'medium'
   };
