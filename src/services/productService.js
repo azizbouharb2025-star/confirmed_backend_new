@@ -3,6 +3,93 @@ const Product = require('../models/Product');
 const Shop = require('../models/Shop');
 const logger = require('../utils/logger');
 
+/**
+ * Convert Converty / CKEditor HTML descriptions to clean plain text.
+ * Keeps useful paragraph/list line breaks while removing markup,
+ * styles, classes and HTML entities.
+ */
+const cleanConvertyDescription = value => {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return '';
+  }
+
+  let text =
+    String(value).trim();
+
+  if (!text) {
+    return '';
+  }
+
+  text = text
+    .replace(/\r\n?/g, '\n')
+
+    // Preserve meaningful line breaks before removing HTML.
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(
+      /<\/(p|div|section|article|blockquote|pre|h[1-6]|tr)>/gi,
+      '\n'
+    )
+    .replace(/<li\b[^>]*>/gi, '• ')
+    .replace(/<\/li>/gi, '\n')
+
+    // Remove all remaining markup.
+    .replace(/<[^>]*>/g, '');
+
+  // Decode numeric HTML entities.
+  text = text
+    .replace(
+      /&#x([0-9a-f]+);/gi,
+      (_, code) => {
+        try {
+          return String.fromCodePoint(
+            parseInt(code, 16)
+          );
+        } catch {
+          return '';
+        }
+      }
+    )
+    .replace(
+      /&#(\d+);/g,
+      (_, code) => {
+        try {
+          return String.fromCodePoint(
+            parseInt(code, 10)
+          );
+        } catch {
+          return '';
+        }
+      }
+    );
+
+  // Decode common named entities.
+  text = text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .replace(/\u00a0/g, ' ');
+
+  // Normalize spaces while preserving paragraphs.
+  text = text
+    .split('\n')
+    .map(line =>
+      line
+        .replace(/[ \t]+/g, ' ')
+        .trim()
+    )
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return text;
+};
+
 class ProductService {
   async syncShopifyProducts(shopId) {
     try {
@@ -270,8 +357,9 @@ class ProductService {
             undefined,
 
           description:
-            source.description ||
-            '',
+            cleanConvertyDescription(
+              source.description
+            ),
 
           imageUrl,
 
