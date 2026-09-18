@@ -14,6 +14,17 @@
 const Shop = require('../models/Shop');
 const Subscription = require('../models/Subscription');
 
+/*
+ * Subscription feature gating is temporarily disabled.
+ *
+ * All authenticated accounts currently have the same
+ * functional feature access.
+ *
+ * Role permissions and shop isolation remain enforced
+ * independently elsewhere in the application.
+ */
+const SUBSCRIPTION_GATING_ENABLED = false;
+
 // Tier hierarchy (higher index = more features)
 const TIER_HIERARCHY = ['free', 'pro', 'business', 'enterprise'];
 
@@ -81,6 +92,10 @@ function getTierFromSubscription(subscription) {
  * @returns {boolean} True if tier has access to feature
  */
 function tierHasFeature(tier, feature) {
+  if (!SUBSCRIPTION_GATING_ENABLED) {
+    return true;
+  }
+
   const tierFeatures = TIER_FEATURES[tier] || [];
   return tierFeatures.includes(feature);
 }
@@ -92,6 +107,10 @@ function tierHasFeature(tier, feature) {
  * @returns {boolean} True if user tier meets requirement
  */
 function tierMeetsMinimum(userTier, requiredTier) {
+  if (!SUBSCRIPTION_GATING_ENABLED) {
+    return true;
+  }
+
   const userIndex = TIER_HIERARCHY.indexOf(userTier);
   const requiredIndex = TIER_HIERARCHY.indexOf(requiredTier);
   return userIndex >= requiredIndex;
@@ -151,6 +170,10 @@ function getMinimumTierForFeature(feature) {
  */
 function getTierFilters(tier, query) {
   const filteredQuery = { ...query };
+
+  if (!SUBSCRIPTION_GATING_ENABLED) {
+    return filteredQuery;
+  }
   
   // Pro+ tier filters: AI score, decision and risk level
   if (!tierMeetsMinimum(tier, 'pro')) {
