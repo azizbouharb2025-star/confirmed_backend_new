@@ -1625,15 +1625,17 @@ const dispatchIntigoReservation = async ({
   }
 
   /*
-   * SECOND VERROU LIVE :
-   * allowlist explicite des CID.
+   * Allowlist live optionnelle.
    *
-   * Même si INTIGO_LIVE_DISPATCH_ENABLED=true,
-   * aucune commande n'est envoyée si son CID
-   * n'est pas explicitement autorisé.
+   * - variable vide/absente :
+   *   toutes les commandes préparées correctement
+   *   peuvent être envoyées.
    *
-   * Fail closed :
-   * allowlist absente/vide = aucun dispatch.
+   * - variable renseignée :
+   *   seules les références listées sont autorisées.
+   *
+   * Le verrou global INTIGO_LIVE_DISPATCH_ENABLED
+   * reste obligatoire avant tout appel réseau.
    */
   const allowedLiveCids =
     String(
@@ -1647,7 +1649,7 @@ const dispatchIntigoReservation = async ({
       .filter(Boolean);
 
   if (
-    allowedLiveCids.length === 0 ||
+    allowedLiveCids.length > 0 &&
     !allowedLiveCids.includes(
       finalPayload.cid
     )
