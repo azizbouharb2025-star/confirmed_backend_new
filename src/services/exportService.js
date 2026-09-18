@@ -311,8 +311,16 @@ class ExportService {
     return {
       'Nom': order.clientInfo?.name || '',
       'Gouvernerat': resolveTunisiaGovernorate(order) || address.state || order.region || '',
-      'Ville': address.city || '',
-      'Localité': address.district || '',
+      'Ville':
+        address.district ||
+        address.city ||
+        resolveTunisiaGovernorate(order) ||
+        address.state ||
+        order.region ||
+        '',
+
+      'Localité':
+        address.district || '',
       'Adresse': address.street || '',
       'code postal': address.zipCode || '',
       'Telephone': order.clientInfo?.phone || '',

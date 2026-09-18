@@ -196,7 +196,9 @@ const mapOrderToColissimo = (
   const city =
     cleanString(
       address.district ||
-      address.city
+      address.city ||
+      governorate ||
+      rawGovernorate
     );
 
   const phone1 =
