@@ -251,8 +251,36 @@ const orderSchema = new mongoose.Schema({
   },
 
   aiScoreDetails: {
+    /*
+     * Score configuration snapshot used when this order
+     * was scored.
+     *
+     * Keeping the version + snapshot prevents future Admin
+     * changes from retroactively changing old orders.
+     */
+    configVersion: {
+      type: Number,
+      default: null
+    },
+
+    configSnapshot: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null
+    },
+
     baseScore: Number,
+
+    /*
+     * Score after all positive/negative signals but before
+     * applying minimumScore / maximumScore.
+     */
+    calculatedScore: Number,
+
+    minimumScore: Number,
+    maximumScore: Number,
+
     finalScore: Number,
+
     factors: [{
       key: String,
       label: String,

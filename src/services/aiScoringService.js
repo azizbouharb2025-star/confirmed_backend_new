@@ -1113,16 +1113,34 @@ class AIScoringService {
     // FINAL
     // =====================================================
 
-    score = Math.max(
-      20,
-      Math.min(
-        97,
-        Math.round(score)
-      )
-    );
+    const baseScore = 65;
+    const minimumScore = 20;
+    const maximumScore = 97;
+
+    /*
+     * Keep the exact historical scoring behavior:
+     * round first, then clamp.
+     *
+     * calculatedScore is the value before the clamp.
+     */
+    const calculatedScore =
+      Math.round(score);
+
+    const finalScore =
+      Math.max(
+        minimumScore,
+        Math.min(
+          maximumScore,
+          calculatedScore
+        )
+      );
 
     return {
-      score,
+      baseScore,
+      calculatedScore,
+      minimumScore,
+      maximumScore,
+      score: finalScore,
       factors
     };
   }
@@ -1392,7 +1410,20 @@ class AIScoringService {
     order.aiScoredAt = new Date();
 
     order.aiScoreDetails = {
-      baseScore: 65,
+      /*
+       * configVersion/configSnapshot remain null until
+       * the scoring engine is connected to the active
+       * database configuration.
+       */
+      configVersion: null,
+      configSnapshot: null,
+      baseScore: result.baseScore,
+      calculatedScore:
+        result.calculatedScore,
+      minimumScore:
+        result.minimumScore,
+      maximumScore:
+        result.maximumScore,
       finalScore: result.score,
       factors: result.factors
     };
