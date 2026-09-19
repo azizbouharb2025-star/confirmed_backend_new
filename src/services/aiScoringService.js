@@ -1,5 +1,6 @@
 const Order = require('../models/Order');
 const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
+const aiScoringConfigService = require('./aiScoringConfigService');
 
 class AIScoringService {
   /**
@@ -892,8 +893,38 @@ class AIScoringService {
    * Minimum  : 20
    * Maximum  : 97
    */
-  calculateAIScore(order, context = {}) {
-    let score = 65;
+  calculateAIScore(
+    order,
+    context = {},
+    scoringConfig = null
+  ) {
+    /*
+     * General score limits now come from the active
+     * database configuration.
+     *
+     * The historical values remain as safe fallbacks so
+     * scoring continues to work if no active config is
+     * available.
+     */
+    const general =
+      scoringConfig?.general || {};
+
+    const baseScore =
+      Number.isFinite(general.baseScore)
+        ? general.baseScore
+        : 65;
+
+    const minimumScore =
+      Number.isFinite(general.minimumScore)
+        ? general.minimumScore
+        : 20;
+
+    const maximumScore =
+      Number.isFinite(general.maximumScore)
+        ? general.maximumScore
+        : 97;
+
+    let score = baseScore;
 
     const factors = [];
 
@@ -1112,10 +1143,6 @@ class AIScoringService {
     // =====================================================
     // FINAL
     // =====================================================
-
-    const baseScore = 65;
-    const minimumScore = 20;
-    const maximumScore = 97;
 
     /*
      * Keep the exact historical scoring behavior:
@@ -1393,13 +1420,25 @@ class AIScoringService {
    * Populate AI fields
    */
   async enrichOrder(order) {
+    /*
+     * Load the active scoring configuration once for this
+     * entire scoring operation.
+     *
+     * This prevents a single order from being calculated
+     * partly with one version and partly with another.
+     */
+    const scoringConfigContext =
+      await aiScoringConfigService
+        .getActiveScoringContext();
+
     const context =
       await this.buildScoringContext(order);
 
     const result =
       this.calculateAIScore(
         order,
-        context
+        context,
+        scoringConfigContext.config
       );
 
     order.aiScore = result.score;
@@ -1410,13 +1449,13 @@ class AIScoringService {
     order.aiScoredAt = new Date();
 
     order.aiScoreDetails = {
-      /*
-       * configVersion/configSnapshot remain null until
-       * the scoring engine is connected to the active
-       * database configuration.
-       */
-      configVersion: null,
-      configSnapshot: null,
+      configVersion:
+        scoringConfigContext
+          .config?.version ?? null,
+
+      configSnapshot:
+        scoringConfigContext.snapshot,
+
       baseScore: result.baseScore,
       calculatedScore:
         result.calculatedScore,
