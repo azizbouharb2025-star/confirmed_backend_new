@@ -3,6 +3,8 @@ const User = require('../models/User');
 const Shop = require('../models/Shop');
 const Order = require('../models/Order');
 const Subscription = require('../models/Subscription');
+const AIScoringConfig = require('../models/AIScoringConfig');
+const aiScoringConfigValidator = require('../services/aiScoringConfigValidationService');
 const { auth, authorize } = require('../middleware/auth');
 
 const router = express.Router();
@@ -1729,5 +1731,375 @@ router.patch('/users/:userId/subscription', auth, authorize('admin'), async (req
     next(error);
   }
 });
+
+
+// ==========================================================
+// AI SCORING ENGINE — READ ONLY
+// ==========================================================
+
+/**
+ * GET /api/admin/ai-scoring/configs
+ * List all scoring configuration versions.
+ */
+router.get(
+  '/ai-scoring/configs',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const configs =
+        await AIScoringConfig
+          .find({})
+          .select({
+            version: 1,
+            status: 1,
+            notes: 1,
+            createdBy: 1,
+            activatedBy: 1,
+            activatedAt: 1,
+            clonedFromVersion: 1,
+            createdAt: 1,
+            updatedAt: 1
+          })
+          .sort({
+            version: -1
+          })
+          .lean();
+
+      return res.json({
+        configs
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/admin/ai-scoring/active
+ * Return the currently active scoring configuration.
+ */
+router.get(
+  '/ai-scoring/active',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const config =
+        await AIScoringConfig
+          .findOne({
+            status: 'active'
+          })
+          .lean();
+
+      return res.json({
+        active: Boolean(config),
+        config: config || null
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/admin/ai-scoring/configs/:version
+ * Return one complete scoring configuration version.
+ */
+router.get(
+  '/ai-scoring/configs/:version',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const version =
+        Number(req.params.version);
+
+      if (
+        !Number.isInteger(version) ||
+        version < 1
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration version'
+        });
+      }
+
+      const config =
+        await AIScoringConfig
+          .findOne({
+            version
+          })
+          .lean();
+
+      if (!config) {
+        return res.status(404).json({
+          error:
+            'AI scoring configuration not found'
+        });
+      }
+
+      return res.json({
+        config
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * PUT /api/admin/ai-scoring/configs/:version
+ *
+ * Update an existing draft configuration.
+ * Version/status/activation metadata cannot be changed here.
+ */
+router.put(
+  '/ai-scoring/configs/:version',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const version =
+        Number(req.params.version);
+
+      if (
+        !Number.isInteger(version) ||
+        version < 1
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration version'
+        });
+      }
+
+      const config =
+        await AIScoringConfig.findOne({
+          version
+        });
+
+      if (!config) {
+        return res.status(404).json({
+          error:
+            'AI scoring configuration not found'
+        });
+      }
+
+      if (config.status !== 'draft') {
+        return res.status(409).json({
+          error:
+            'Only draft AI scoring configurations can be edited'
+        });
+      }
+
+      const allowedFields = [
+        'general',
+        'patterns',
+        'customerHistory',
+        'operatorFeedback',
+        'notes'
+      ];
+
+      const suppliedFields =
+        Object.keys(req.body || {});
+
+      const forbiddenFields =
+        suppliedFields.filter(
+          field =>
+            !allowedFields.includes(field)
+        );
+
+      if (forbiddenFields.length > 0) {
+        return res.status(400).json({
+          error:
+            'Unsupported AI scoring configuration fields',
+          fields: forbiddenFields
+        });
+      }
+
+      if (suppliedFields.length === 0) {
+        return res.status(400).json({
+          error:
+            'No AI scoring configuration fields supplied'
+        });
+      }
+
+      for (const field of allowedFields) {
+        if (
+          Object.prototype.hasOwnProperty.call(
+            req.body,
+            field
+          )
+        ) {
+          config.set(
+            field,
+            req.body[field]
+          );
+        }
+      }
+
+      await config.validate();
+
+      const validation =
+        aiScoringConfigValidator
+          .validateForActivation(
+            config.toObject()
+          );
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration',
+          details:
+            validation.errors
+        });
+      }
+
+      await config.save();
+
+      return res.json({
+        message:
+          'AI scoring draft configuration updated',
+        config
+      });
+    } catch (error) {
+      if (
+        error?.name ===
+        'ValidationError'
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration',
+          details:
+            Object.values(
+              error.errors || {}
+            ).map(
+              item => item.message
+            )
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * POST /api/admin/ai-scoring/configs/:version/clone
+ *
+ * Clone an existing configuration into a new draft version.
+ */
+router.post(
+  '/ai-scoring/configs/:version/clone',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const sourceVersion =
+        Number(req.params.version);
+
+      if (
+        !Number.isInteger(sourceVersion) ||
+        sourceVersion < 1
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration version'
+        });
+      }
+
+      const source =
+        await AIScoringConfig.findOne({
+          version: sourceVersion
+        });
+
+      if (!source) {
+        return res.status(404).json({
+          error:
+            'AI scoring configuration not found'
+        });
+      }
+
+      const latest =
+        await AIScoringConfig
+          .findOne({})
+          .sort({ version: -1 })
+          .select({ version: 1 })
+          .lean();
+
+      const newVersion =
+        (latest?.version || 0) + 1;
+
+      const cloneData =
+        source.toObject({
+          depopulate: true
+        });
+
+      delete cloneData._id;
+      delete cloneData.__v;
+      delete cloneData.version;
+      delete cloneData.status;
+      delete cloneData.createdBy;
+      delete cloneData.activatedBy;
+      delete cloneData.activatedAt;
+      delete cloneData.clonedFromVersion;
+      delete cloneData.createdAt;
+      delete cloneData.updatedAt;
+
+      const clone =
+        new AIScoringConfig({
+          ...cloneData,
+
+          version: newVersion,
+          status: 'draft',
+
+          createdBy:
+            req.user._id,
+
+          clonedFromVersion:
+            sourceVersion,
+
+          activatedBy: null,
+          activatedAt: null
+        });
+
+      await clone.validate();
+
+      const validation =
+        aiScoringConfigValidator
+          .validateForActivation(
+            clone.toObject()
+          );
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          error:
+            'Cannot clone invalid AI scoring configuration',
+          details:
+            validation.errors
+        });
+      }
+
+      await clone.save();
+
+      return res.status(201).json({
+        message:
+          `AI scoring configuration V${newVersion} created as draft`,
+        config: clone
+      });
+    } catch (error) {
+      if (error?.code === 11000) {
+        return res.status(409).json({
+          error:
+            'AI scoring version conflict. Please retry.'
+        });
+      }
+
+      next(error);
+    }
+  }
+);
 
 module.exports = router;
