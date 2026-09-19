@@ -2102,4 +2102,174 @@ router.post(
   }
 );
 
+
+/**
+ * POST /api/admin/ai-scoring/configs/:version/activate
+ *
+ * First activation only.
+ *
+ * MongoDB currently runs without replica-set transactions.
+ * Therefore this endpoint only activates a draft when
+ * no other configuration is active.
+ *
+ * Replacing an existing active version will be handled
+ * separately with rollback protection.
+ */
+router.post(
+  '/ai-scoring/configs/:version/activate',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const version =
+        Number(req.params.version);
+
+      if (
+        !Number.isInteger(version) ||
+        version < 1
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration version'
+        });
+      }
+
+      const target =
+        await AIScoringConfig.findOne({
+          version
+        });
+
+      if (!target) {
+        return res.status(404).json({
+          error:
+            'AI scoring configuration not found'
+        });
+      }
+
+      if (target.status !== 'draft') {
+        return res.status(409).json({
+          error:
+            'Only draft AI scoring configurations can be activated'
+        });
+      }
+
+      /*
+       * Validate the complete configuration immediately
+       * before activation.
+       */
+      await target.validate();
+
+      const validation =
+        aiScoringConfigValidator
+          .validateForActivation(
+            target.toObject()
+          );
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          error:
+            'AI scoring configuration cannot be activated',
+          details:
+            validation.errors
+        });
+      }
+
+      /*
+       * For now activation is allowed only when there
+       * is no existing active configuration.
+       */
+      const activeConfig =
+        await AIScoringConfig
+          .findOne({
+            status: 'active'
+          })
+          .select({
+            version: 1
+          })
+          .lean();
+
+      if (activeConfig) {
+        return res.status(409).json({
+          error:
+            'An AI scoring configuration is already active',
+          activeVersion:
+            activeConfig.version
+        });
+      }
+
+      const activatedAt =
+        new Date();
+
+      /*
+       * Atomic single-document update.
+       *
+       * status:draft is included in the filter to prevent
+       * stale or repeated activation requests.
+       */
+      const activated =
+        await AIScoringConfig
+          .findOneAndUpdate(
+            {
+              version,
+              status: 'draft'
+            },
+            {
+              $set: {
+                status: 'active',
+                activatedBy:
+                  req.user._id,
+                activatedAt
+              }
+            },
+            {
+              new: true,
+              runValidators: true
+            }
+          );
+
+      if (!activated) {
+        return res.status(409).json({
+          error:
+            'AI scoring configuration activation conflict'
+        });
+      }
+
+      return res.json({
+        message:
+          `AI scoring configuration V${version} activated`,
+        config: activated
+      });
+    } catch (error) {
+      /*
+       * The unique partial index on status=active is
+       * the final database-level concurrency protection.
+       */
+      if (error?.code === 11000) {
+        return res.status(409).json({
+          error:
+            'Another AI scoring configuration became active first'
+        });
+      }
+
+      if (
+        error?.name ===
+        'ValidationError'
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration',
+          details:
+            Object.values(
+              error.errors || {}
+            ).map(
+              item => item.message
+            )
+        });
+      }
+
+      next(error);
+    }
+  }
+);
+
 module.exports = router;
