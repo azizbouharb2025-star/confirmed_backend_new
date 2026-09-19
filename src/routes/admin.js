@@ -2106,14 +2106,12 @@ router.post(
 /**
  * POST /api/admin/ai-scoring/configs/:version/activate
  *
- * First activation only.
+ * Activate a draft AI scoring configuration.
  *
  * MongoDB currently runs without replica-set transactions.
- * Therefore this endpoint only activates a draft when
- * no other configuration is active.
- *
- * Replacing an existing active version will be handled
- * separately with rollback protection.
+ * When replacing an active configuration, the previous
+ * version is archived first. If activation fails, the
+ * previous version is restored automatically.
  */
 router.post(
   '/ai-scoring/configs/:version/activate',
@@ -2174,51 +2172,88 @@ router.post(
         });
       }
 
-      /*
-       * For now activation is allowed only when there
-       * is no existing active configuration.
-       */
       const activeConfig =
         await AIScoringConfig
           .findOne({
             status: 'active'
           })
           .select({
+            _id: 1,
             version: 1
           })
           .lean();
 
-      if (activeConfig) {
-        return res.status(409).json({
-          error:
-            'An AI scoring configuration is already active',
-          activeVersion:
-            activeConfig.version
-        });
-      }
-
       const activatedAt =
         new Date();
 
+      const activationUpdate = {
+        $set: {
+          status: 'active',
+          activatedBy:
+            req.user._id,
+          activatedAt
+        }
+      };
+
       /*
-       * Atomic single-document update.
+       * CASE 1:
+       * No active configuration exists.
        *
-       * status:draft is included in the filter to prevent
-       * stale or repeated activation requests.
+       * This is a single-document atomic activation.
        */
-      const activated =
+      if (!activeConfig) {
+        const activated =
+          await AIScoringConfig
+            .findOneAndUpdate(
+              {
+                version,
+                status: 'draft'
+              },
+              activationUpdate,
+              {
+                new: true,
+                runValidators: true
+              }
+            );
+
+        if (!activated) {
+          return res.status(409).json({
+            error:
+              'AI scoring configuration activation conflict'
+          });
+        }
+
+        return res.json({
+          message:
+            `AI scoring configuration V${version} activated`,
+          previousVersion: null,
+          config: activated
+        });
+      }
+
+      /*
+       * CASE 2:
+       * Replace an existing active configuration.
+       *
+       * MongoDB is standalone, so there is no multi-document
+       * transaction. We therefore:
+       *
+       * 1. archive the current active version conditionally;
+       * 2. activate the requested draft;
+       * 3. restore the old version if step 2 fails.
+       */
+
+      const archived =
         await AIScoringConfig
           .findOneAndUpdate(
             {
-              version,
-              status: 'draft'
+              _id:
+                activeConfig._id,
+              status: 'active'
             },
             {
               $set: {
-                status: 'active',
-                activatedBy:
-                  req.user._id,
-                activatedAt
+                status: 'archived'
               }
             },
             {
@@ -2227,16 +2262,97 @@ router.post(
             }
           );
 
-      if (!activated) {
+      if (!archived) {
         return res.status(409).json({
           error:
-            'AI scoring configuration activation conflict'
+            'Active AI scoring configuration changed during activation'
         });
+      }
+
+      let activated = null;
+
+      try {
+        activated =
+          await AIScoringConfig
+            .findOneAndUpdate(
+              {
+                version,
+                status: 'draft'
+              },
+              activationUpdate,
+              {
+                new: true,
+                runValidators: true
+              }
+            );
+
+        if (!activated) {
+          throw new Error(
+            'TARGET_ACTIVATION_CONFLICT'
+          );
+        }
+      } catch (activationError) {
+        /*
+         * Roll back the previous active configuration.
+         */
+        try {
+          const restored =
+            await AIScoringConfig
+              .findOneAndUpdate(
+                {
+                  _id:
+                    activeConfig._id,
+                  status: 'archived'
+                },
+                {
+                  $set: {
+                    status: 'active'
+                  }
+                },
+                {
+                  new: true,
+                  runValidators: true
+                }
+              );
+
+          if (!restored) {
+            const rollbackError =
+              new Error(
+                'AI_SCORING_ACTIVATION_ROLLBACK_FAILED'
+              );
+
+            rollbackError.cause =
+              activationError;
+
+            throw rollbackError;
+          }
+        } catch (rollbackError) {
+          rollbackError.activationError =
+            activationError;
+
+          throw rollbackError;
+        }
+
+        if (
+          activationError.message ===
+          'TARGET_ACTIVATION_CONFLICT'
+        ) {
+          return res.status(409).json({
+            error:
+              'AI scoring configuration activation conflict. Previous active version restored.',
+            activeVersion:
+              activeConfig.version
+          });
+        }
+
+        throw activationError;
       }
 
       return res.json({
         message:
           `AI scoring configuration V${version} activated`,
+        previousVersion:
+          activeConfig.version,
         config: activated
       });
     } catch (error) {
