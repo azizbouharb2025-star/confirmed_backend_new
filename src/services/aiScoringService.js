@@ -1,3 +1,8 @@
+const {
+  normalizeCustomerPhoneIdentity,
+  buildCustomerPhoneRegex
+} = require('../utils/customerPhoneIdentity');
+
 const Order = require('../models/Order');
 const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 const aiScoringConfigService = require('./aiScoringConfigService');
@@ -963,10 +968,26 @@ class AIScoringService {
       }
     };
 
-    const phone =
-      typeof order.clientInfo?.phone === 'string'
-        ? order.clientInfo.phone.trim()
-        : '';
+    /*
+     * Customer identity is based on a normalized phone,
+     * but clientInfo.phone itself is NEVER modified here.
+     *
+     * Examples treated as the same Tunisian customer:
+     *
+     * 22123456
+     * +21622123456
+     * 0021622123456
+     * 22 123 456
+     */
+    const customerPhoneIdentity =
+      normalizeCustomerPhoneIdentity(
+        order.clientInfo?.phone
+      );
+
+    const customerPhoneRegex =
+      buildCustomerPhoneRegex(
+        customerPhoneIdentity
+      );
 
     const shopId =
       order.shopId?._id ||
@@ -994,10 +1015,19 @@ class AIScoringService {
     // HISTORIQUE CLIENT + HABITUDES DE MONTANT
     // ======================================================
 
-    if (phone) {
+    if (
+      customerPhoneIdentity &&
+      customerPhoneRegex
+    ) {
       const customerQuery = {
         ...baseShopQuery,
-        'clientInfo.phone': phone
+
+        /*
+         * Match historical formatting variants without
+         * rewriting old orders in MongoDB.
+         */
+        'clientInfo.phone':
+          customerPhoneRegex
       };
 
       const [
