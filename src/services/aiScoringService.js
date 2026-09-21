@@ -1437,7 +1437,8 @@ class AIScoringService {
    *   de la boutique.
    */
   calculateOrderTimeHistoryAdjustment(
-    history
+    history,
+    scoringConfig = null
   ) {
     const sameHourCompleted =
       Number(
@@ -1454,8 +1455,113 @@ class AIScoringService {
         history?.overallFailureRate
       );
 
+    /*
+     * Historical fallback.
+     *
+     * Preserve the exact previous behavior when no
+     * active database configuration is provided.
+     */
+    if (!scoringConfig) {
+      if (
+        sameHourCompleted < 5 ||
+        !Number.isFinite(
+          sameHourFailureRate
+        ) ||
+        !Number.isFinite(
+          overallFailureRate
+        )
+      ) {
+        return {
+          adjustment: 0,
+          state: 'insufficient'
+        };
+      }
+
+      const excessFailureRate =
+        sameHourFailureRate -
+        overallFailureRate;
+
+      if (
+        sameHourFailureRate >= 30 &&
+        excessFailureRate >= 15
+      ) {
+        return {
+          adjustment: -3,
+          state: 'historically_risky'
+        };
+      }
+
+      return {
+        adjustment: 0,
+        state: 'normal'
+      };
+    }
+
+    const patterns =
+      scoringConfig.patterns || {};
+
+    const orderTime =
+      patterns.orderTime || null;
+
+    const historicalSignal =
+      orderTime?.historicalSignal || null;
+
+    /*
+     * Admin can disable:
+     * - all Patterns;
+     * - Order Time;
+     * - only the historical signal.
+     */
     if (
-      sameHourCompleted < 5 ||
+      patterns.enabled === false ||
+      !orderTime ||
+      orderTime.enabled === false ||
+      !historicalSignal ||
+      historicalSignal.enabled === false
+    ) {
+      return {
+        adjustment: 0,
+        state: 'disabled'
+      };
+    }
+
+    const minimumCompletedOrders =
+      Number.isFinite(
+        historicalSignal
+          .minimumCompletedOrders
+      )
+        ? historicalSignal
+            .minimumCompletedOrders
+        : 5;
+
+    const minimumFailureRate =
+      Number.isFinite(
+        historicalSignal
+          .minimumFailureRate
+      )
+        ? historicalSignal
+            .minimumFailureRate
+        : 30;
+
+    const minimumExcessFailureRate =
+      Number.isFinite(
+        historicalSignal
+          .minimumExcessFailureRate
+      )
+        ? historicalSignal
+            .minimumExcessFailureRate
+        : 15;
+
+    const configuredImpact =
+      Number.isFinite(
+        historicalSignal.impact
+      )
+        ? historicalSignal.impact
+        : -3;
+
+    if (
+      sameHourCompleted <
+        minimumCompletedOrders ||
       !Number.isFinite(
         sameHourFailureRate
       ) ||
@@ -1474,12 +1580,16 @@ class AIScoringService {
       overallFailureRate;
 
     if (
-      sameHourFailureRate >= 30 &&
-      excessFailureRate >= 15
+      sameHourFailureRate >=
+        minimumFailureRate &&
+      excessFailureRate >=
+        minimumExcessFailureRate
     ) {
       return {
-        adjustment: -3,
-        state: 'historically_risky'
+        adjustment:
+          configuredImpact,
+        state:
+          'historically_risky'
       };
     }
 
@@ -1636,7 +1746,8 @@ class AIScoringService {
 
     const timeHistory =
       this.calculateOrderTimeHistoryAdjustment(
-        context.orderTimeHistory
+        context.orderTimeHistory,
+        scoringConfig
       );
 
     /*
