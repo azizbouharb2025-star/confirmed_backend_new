@@ -752,20 +752,117 @@ class AIScoringService {
    * Elle reste donc neutre en V1 plutôt que d'inventer
    * des seuils.
    */
-  calculateOrderAmountAdjustment(amount) {
+  calculateOrderAmountAdjustment(
+    amount,
+    scoringConfig = null
+  ) {
     const value = Number(amount);
 
     if (!Number.isFinite(value)) {
       return 0;
     }
 
-    if (value < 30) return -1;
-    if (value < 150) return 0;
-    if (value < 250) return -1;
-    if (value < 400) return -3;
-    if (value < 600) return -5;
+    /*
+     * Historical fallback.
+     *
+     * This preserves the exact previous behavior when
+     * calculateAIScore() is called without a DB config.
+     */
+    if (!scoringConfig) {
+      if (value < 30) return -1;
+      if (value < 150) return 0;
+      if (value < 250) return -1;
+      if (value < 400) return -3;
+      if (value < 600) return -5;
 
-    return -6;
+      return -6;
+    }
+
+    const patterns =
+      scoringConfig.patterns || {};
+
+    const orderValue =
+      patterns.orderValue || null;
+
+    const absoluteValue =
+      orderValue?.absoluteValue || null;
+
+    /*
+     * Admin can disable:
+     * - all Patterns;
+     * - Order Value;
+     * - Absolute Value specifically.
+     */
+    if (
+      patterns.enabled === false ||
+      !orderValue ||
+      orderValue.enabled === false ||
+      !absoluteValue ||
+      absoluteValue.enabled === false
+    ) {
+      return 0;
+    }
+
+    const rules =
+      Array.isArray(
+        absoluteValue.rules
+      )
+        ? absoluteValue.rules
+        : [];
+
+    const enabledRules =
+      rules
+        .filter(
+          rule =>
+            rule.enabled !== false
+        )
+        .sort(
+          (a, b) =>
+            Number(a.order || 0) -
+            Number(b.order || 0)
+        );
+
+    for (const rule of enabledRules) {
+      const hasMin =
+        Number.isFinite(rule.min);
+
+      const hasMax =
+        Number.isFinite(rule.max);
+
+      const minMatches =
+        !hasMin ||
+        (
+          rule.includeMin === false
+            ? value > rule.min
+            : value >= rule.min
+        );
+
+      const maxMatches =
+        !hasMax ||
+        (
+          rule.includeMax === false
+            ? value < rule.max
+            : value <= rule.max
+        );
+
+      if (
+        minMatches &&
+        maxMatches
+      ) {
+        return Number.isFinite(
+          rule.impact
+        )
+          ? rule.impact
+          : 0;
+      }
+    }
+
+    /*
+     * Activation validation is designed to prevent gaps,
+     * but if no active rule matches for any reason, fail
+     * safely with no adjustment.
+     */
+    return 0;
   }
 
   /**
@@ -1151,7 +1248,8 @@ class AIScoringService {
 
     const amountAdjustment =
       this.calculateOrderAmountAdjustment(
-        order.totalAmount
+        order.totalAmount,
+        scoringConfig
       );
 
     score += amountAdjustment;
