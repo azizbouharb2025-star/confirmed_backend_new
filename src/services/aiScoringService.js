@@ -905,49 +905,252 @@ class AIScoringService {
   }
 
   /**
+   * Minute locale tunisienne depuis minuit.
+   *
+   * Exemple :
+   * 08:30 -> 510
+   * 22:00 -> 1320
+   *
+   * Cette valeur permet aux règles Admin d'utiliser
+   * des créneaux plus précis qu'une heure entière.
+   */
+  getTunisiaOrderMinuteOfDay(order) {
+    const date =
+      order.createdAt
+        ? new Date(order.createdAt)
+        : new Date();
+
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+
+    const parts =
+      new Intl.DateTimeFormat(
+        'en-GB',
+        {
+          timeZone: 'Africa/Tunis',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false
+        }
+      ).formatToParts(date);
+
+    const hourPart =
+      parts.find(
+        part =>
+          part.type === 'hour'
+      );
+
+    const minutePart =
+      parts.find(
+        part =>
+          part.type === 'minute'
+      );
+
+    if (
+      !hourPart ||
+      !minutePart
+    ) {
+      return null;
+    }
+
+    const hour =
+      Number(hourPart.value) % 24;
+
+    const minute =
+      Number(minutePart.value);
+
+    if (
+      !Number.isFinite(hour) ||
+      !Number.isFinite(minute)
+    ) {
+      return null;
+    }
+
+    return (
+      hour * 60 +
+      minute
+    );
+  }
+
+  /**
    * PDF : heure de commande.
    */
-  calculateOrderTimeAdjustment(order) {
-    const hour = this.getTunisiaOrderHour(order);
+  calculateOrderTimeAdjustment(
+    order,
+    scoringConfig = null
+  ) {
+    const hour =
+      this.getTunisiaOrderHour(order);
 
-    if (hour === null) {
+    const minuteOfDay =
+      this.getTunisiaOrderMinuteOfDay(
+        order
+      );
+
+    if (
+      hour === null ||
+      minuteOfDay === null
+    ) {
       return {
         adjustment: 0,
-        hour: null
+        hour: null,
+        minuteOfDay: null,
+        state: 'invalid_time'
       };
     }
 
-    if (hour >= 8 && hour < 22) {
-      return {
-        adjustment: 0,
-        hour
-      };
-    }
+    /*
+     * Historical fallback.
+     *
+     * Preserve the exact old behavior when no DB config
+     * is provided.
+     */
+    if (!scoringConfig) {
+      if (
+        hour >= 8 &&
+        hour < 22
+      ) {
+        return {
+          adjustment: 0,
+          hour,
+          minuteOfDay,
+          state: '08_22'
+        };
+      }
 
-    if (hour >= 22) {
+      if (hour >= 22) {
+        return {
+          adjustment: -1,
+          hour,
+          minuteOfDay,
+          state: '22_24'
+        };
+      }
+
+      if (hour < 2) {
+        return {
+          adjustment: -2,
+          hour,
+          minuteOfDay,
+          state: '00_02'
+        };
+      }
+
+      if (hour < 6) {
+        return {
+          adjustment: -3,
+          hour,
+          minuteOfDay,
+          state: '02_06'
+        };
+      }
+
       return {
         adjustment: -1,
-        hour
+        hour,
+        minuteOfDay,
+        state: '06_08'
       };
     }
 
-    if (hour < 2) {
+    const patterns =
+      scoringConfig.patterns || {};
+
+    const orderTime =
+      patterns.orderTime || null;
+
+    /*
+     * Admin can disable either all Patterns or only the
+     * Order Time category.
+     */
+    if (
+      patterns.enabled === false ||
+      !orderTime ||
+      orderTime.enabled === false
+    ) {
       return {
-        adjustment: -2,
-        hour
+        adjustment: 0,
+        hour,
+        minuteOfDay,
+        state: 'disabled'
       };
     }
 
-    if (hour < 6) {
-      return {
-        adjustment: -3,
-        hour
-      };
+    const rules =
+      Array.isArray(
+        orderTime.rules
+      )
+        ? orderTime.rules
+        : [];
+
+    const enabledRules =
+      rules
+        .filter(
+          rule =>
+            rule.enabled !== false
+        )
+        .sort(
+          (a, b) =>
+            Number(a.order || 0) -
+            Number(b.order || 0)
+        );
+
+    for (const rule of enabledRules) {
+      const startMinute =
+        Number(rule.startMinute);
+
+      const endMinute =
+        Number(rule.endMinute);
+
+      if (
+        !Number.isFinite(startMinute) ||
+        !Number.isFinite(endMinute)
+      ) {
+        continue;
+      }
+
+      /*
+       * Time ranges use:
+       * start inclusive
+       * end exclusive
+       *
+       * Example:
+       * 08:00–22:00 means
+       * >= 480 and < 1320.
+       */
+      if (
+        minuteOfDay >= startMinute &&
+        minuteOfDay < endMinute
+      ) {
+        return {
+          adjustment:
+            Number.isFinite(rule.impact)
+              ? rule.impact
+              : 0,
+
+          hour,
+          minuteOfDay,
+
+          state:
+            rule.key ||
+            'matched'
+        };
+      }
     }
 
+    /*
+     * Activation validation normally guarantees full
+     * 00:00–24:00 coverage.
+     *
+     * If malformed data reaches the engine anyway,
+     * fail safely without changing the score.
+     */
     return {
-      adjustment: -1,
-      hour
+      adjustment: 0,
+      hour,
+      minuteOfDay,
+      state: 'unmatched'
     };
   }
 
@@ -1426,7 +1629,10 @@ class AIScoringService {
     // =====================================================
 
     const timeResult =
-      this.calculateOrderTimeAdjustment(order);
+      this.calculateOrderTimeAdjustment(
+        order,
+        scoringConfig
+      );
 
     const timeHistory =
       this.calculateOrderTimeHistoryAdjustment(
