@@ -505,12 +505,95 @@ class AIScoringService {
   /**
    * PDF : historique de livraisons réussies.
    */
-  calculateCustomerSuccessAdjustment(count) {
-    if (count >= 11) return 10;
-    if (count >= 7) return 8;
-    if (count >= 4) return 6;
-    if (count >= 2) return 4;
-    if (count >= 1) return 2;
+  calculateCustomerSuccessAdjustment(
+    count,
+    scoringConfig = null
+  ) {
+    const value =
+      Number(count) || 0;
+
+    /*
+     * Historical fallback.
+     */
+    if (!scoringConfig) {
+      if (value >= 11) return 10;
+      if (value >= 7) return 8;
+      if (value >= 4) return 6;
+      if (value >= 2) return 4;
+      if (value >= 1) return 2;
+
+      return 0;
+    }
+
+    const customerHistory =
+      scoringConfig.customerHistory || null;
+
+    const successConfig =
+      customerHistory?.successfulDeliveries ||
+      null;
+
+    if (
+      !customerHistory ||
+      customerHistory.enabled === false ||
+      !successConfig ||
+      successConfig.enabled === false
+    ) {
+      return 0;
+    }
+
+    const rules =
+      Array.isArray(
+        successConfig.rules
+      )
+        ? successConfig.rules
+        : [];
+
+    const enabledRules =
+      rules
+        .filter(
+          rule =>
+            rule.enabled !== false
+        )
+        .sort(
+          (a, b) =>
+            Number(a.order || 0) -
+            Number(b.order || 0)
+        );
+
+    for (const rule of enabledRules) {
+      const hasMin =
+        Number.isFinite(rule.min);
+
+      const hasMax =
+        Number.isFinite(rule.max);
+
+      const minMatches =
+        !hasMin ||
+        (
+          rule.includeMin === false
+            ? value > rule.min
+            : value >= rule.min
+        );
+
+      const maxMatches =
+        !hasMax ||
+        (
+          rule.includeMax === false
+            ? value < rule.max
+            : value <= rule.max
+        );
+
+      if (
+        minMatches &&
+        maxMatches
+      ) {
+        return Number.isFinite(
+          rule.impact
+        )
+          ? rule.impact
+          : 0;
+      }
+    }
 
     return 0;
   }
@@ -518,12 +601,95 @@ class AIScoringService {
   /**
    * PDF : historique d'échecs de livraison.
    */
-  calculateCustomerFailureAdjustment(count) {
-    if (count >= 6) return -15;
-    if (count >= 4) return -12;
-    if (count >= 3) return -9;
-    if (count >= 2) return -6;
-    if (count >= 1) return -3;
+  calculateCustomerFailureAdjustment(
+    count,
+    scoringConfig = null
+  ) {
+    const value =
+      Number(count) || 0;
+
+    /*
+     * Historical fallback.
+     */
+    if (!scoringConfig) {
+      if (value >= 6) return -15;
+      if (value >= 4) return -12;
+      if (value >= 3) return -9;
+      if (value >= 2) return -6;
+      if (value >= 1) return -3;
+
+      return 0;
+    }
+
+    const customerHistory =
+      scoringConfig.customerHistory || null;
+
+    const failureConfig =
+      customerHistory?.failedDeliveries ||
+      null;
+
+    if (
+      !customerHistory ||
+      customerHistory.enabled === false ||
+      !failureConfig ||
+      failureConfig.enabled === false
+    ) {
+      return 0;
+    }
+
+    const rules =
+      Array.isArray(
+        failureConfig.rules
+      )
+        ? failureConfig.rules
+        : [];
+
+    const enabledRules =
+      rules
+        .filter(
+          rule =>
+            rule.enabled !== false
+        )
+        .sort(
+          (a, b) =>
+            Number(a.order || 0) -
+            Number(b.order || 0)
+        );
+
+    for (const rule of enabledRules) {
+      const hasMin =
+        Number.isFinite(rule.min);
+
+      const hasMax =
+        Number.isFinite(rule.max);
+
+      const minMatches =
+        !hasMin ||
+        (
+          rule.includeMin === false
+            ? value > rule.min
+            : value >= rule.min
+        );
+
+      const maxMatches =
+        !hasMax ||
+        (
+          rule.includeMax === false
+            ? value < rule.max
+            : value <= rule.max
+        );
+
+      if (
+        minMatches &&
+        maxMatches
+      ) {
+        return Number.isFinite(
+          rule.impact
+        )
+          ? rule.impact
+          : 0;
+      }
+    }
 
     return 0;
   }
@@ -1816,12 +1982,14 @@ class AIScoringService {
 
     const successAdjustment =
       this.calculateCustomerSuccessAdjustment(
-        successfulDeliveries
+        successfulDeliveries,
+        scoringConfig
       );
 
     const failureAdjustment =
       this.calculateCustomerFailureAdjustment(
-        failedDeliveries
+        failedDeliveries,
+        scoringConfig
       );
 
     score += successAdjustment;
