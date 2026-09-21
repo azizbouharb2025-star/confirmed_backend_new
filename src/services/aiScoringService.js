@@ -1381,6 +1381,219 @@ class AIScoringService {
     };
   }
 
+
+  /**
+   * Zone géographique configurable.
+   *
+   * Compatibility behavior:
+   * - no scoringConfig => historical geographic behavior;
+   * - geographic category disabled => neutral;
+   * - no configured direct rules => preserve historical
+   *   behavior;
+   * - direct rules configured => use only direct rules.
+   *
+   * This prevents direct geographic rules and historical
+   * geographic performance from being counted together.
+   */
+  calculateGeographicZoneAdjustment(
+    order,
+    history,
+    scoringConfig = null
+  ) {
+    const address =
+      order.clientInfo?.address || {};
+
+    const governorate = String(
+      address.state ||
+      order.region ||
+      resolveTunisiaGovernorate(order) ||
+      ''
+    ).trim();
+
+    const delegation = String(
+      address.district || ''
+    ).trim();
+
+    const city = String(
+      address.city || ''
+    ).trim();
+
+    const postalCode = String(
+      address.zipCode ||
+      address.postalCode ||
+      ''
+    ).trim();
+
+    const historicalLocation =
+      String(
+        history?.region ||
+        governorate ||
+        city ||
+        ''
+      ).trim();
+
+    /*
+     * Old calls without V3 keep their exact historical
+     * geographic scoring behavior.
+     */
+    if (!scoringConfig) {
+      const legacy =
+        this.calculateRegionHistoryAdjustment(
+          history
+        );
+
+      return {
+        ...legacy,
+        source: 'historical',
+        locationType: 'governorate',
+        locationValue:
+          historicalLocation
+      };
+    }
+
+    const patterns =
+      scoringConfig.patterns || {};
+
+    const geographicZone =
+      patterns.geographicZone || null;
+
+    if (
+      patterns.enabled === false ||
+      !geographicZone ||
+      geographicZone.enabled === false
+    ) {
+      return {
+        adjustment: 0,
+        state: 'disabled',
+        source: 'disabled',
+        locationType: null,
+        locationValue:
+          historicalLocation
+      };
+    }
+
+    const configuredRules =
+      Array.isArray(
+        geographicZone.rules
+      )
+        ? geographicZone.rules
+        : [];
+
+    const enabledRules =
+      configuredRules
+        .filter(
+          rule =>
+            rule.enabled !== false
+        )
+        .sort(
+          (a, b) =>
+            Number(a.order || 0) -
+            Number(b.order || 0)
+        );
+
+    /*
+     * V3 currently has no direct geographic rules.
+     *
+     * Until Admin configures at least one rule, preserve
+     * the existing Confirmed geographic-history behavior.
+     */
+    if (enabledRules.length === 0) {
+      const legacy =
+        this.calculateRegionHistoryAdjustment(
+          history
+        );
+
+      return {
+        ...legacy,
+        source:
+          'historical_compatibility',
+        locationType:
+          'governorate',
+        locationValue:
+          historicalLocation
+      };
+    }
+
+    const locationValues = {
+      governorate,
+      delegation,
+      city,
+      postal_code: postalCode
+    };
+
+    const normalizeLocation =
+      value =>
+        String(value || '')
+          .normalize('NFKC')
+          .trim()
+          .replace(/\s+/g, ' ')
+          .toLocaleLowerCase();
+
+    /*
+     * Geographic Zone is one scoring category.
+     *
+     * If several rules could match the same order, the
+     * first enabled rule according to "order" wins.
+     * We intentionally do not stack multiple geographic
+     * bonuses/penalties.
+     */
+    for (const rule of enabledRules) {
+      const locationType =
+        rule.locationType;
+
+      const actualValue =
+        locationValues[
+          locationType
+        ];
+
+      if (!actualValue) {
+        continue;
+      }
+
+      if (
+        normalizeLocation(actualValue) !==
+        normalizeLocation(
+          rule.locationValue
+        )
+      ) {
+        continue;
+      }
+
+      return {
+        adjustment:
+          Number.isFinite(rule.impact)
+            ? rule.impact
+            : 0,
+
+        state: 'matched',
+        source: 'configured',
+        locationType,
+        locationValue:
+          actualValue,
+
+        ruleKey:
+          rule.key || null
+      };
+    }
+
+    /*
+     * Direct rules exist, but this order does not match
+     * any of them.
+     *
+     * Do not fall back to historical scoring here:
+     * otherwise the Admin rule system and the historical
+     * system would be mixed unpredictably.
+     */
+    return {
+      adjustment: 0,
+      state: 'unmatched',
+      source: 'configured',
+      locationType: null,
+      locationValue:
+        historicalLocation
+    };
+  }
+
   /**
    * Montant relatif aux habitudes du client.
    *
@@ -1831,18 +2044,21 @@ class AIScoringService {
     // 2. ZONE GEOGRAPHIQUE
     // =====================================================
 
-    const regionHistory =
-      this.calculateRegionHistoryAdjustment(
-        context.regionHistory
+    const geographicResult =
+      this.calculateGeographicZoneAdjustment(
+        order,
+        context.regionHistory,
+        scoringConfig
       );
 
     score +=
-      regionHistory.adjustment;
+      geographicResult.adjustment;
 
     factors.push({
       key: 'region',
       label: 'Zone géographique',
       value:
+        geographicResult.locationValue ||
         context.regionHistory?.region ||
         resolveTunisiaGovernorate(order) ||
         order.region ||
@@ -1850,9 +2066,9 @@ class AIScoringService {
         order.clientInfo?.address?.city ||
         '',
       impact:
-        regionHistory.adjustment,
+        geographicResult.adjustment,
       applied:
-        regionHistory.adjustment !== 0
+        geographicResult.adjustment !== 0
     });
 
     // =====================================================
