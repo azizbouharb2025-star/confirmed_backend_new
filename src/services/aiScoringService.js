@@ -1020,7 +1020,8 @@ class AIScoringService {
    */
   calculateOrderAmountHistoryAdjustment(
     amount,
-    history
+    history,
+    scoringConfig = null
   ) {
     const orderCount =
       Number(
@@ -1035,8 +1036,107 @@ class AIScoringService {
     const current =
       Number(amount);
 
+    /*
+     * Historical fallback configuration.
+     *
+     * This keeps the previous scoring behavior available
+     * when no database configuration is supplied.
+     */
+    if (!scoringConfig) {
+      if (
+        orderCount < 3 ||
+        !Number.isFinite(average) ||
+        average <= 0 ||
+        !Number.isFinite(current)
+      ) {
+        return {
+          adjustment: 0,
+          state: 'insufficient',
+          ratio: null
+        };
+      }
+
+      const ratio =
+        current / average;
+
+      if (ratio < 0.5) {
+        return {
+          adjustment: -1,
+          state: 'very_low',
+          ratio
+        };
+      }
+
+      if (ratio <= 1.25) {
+        return {
+          adjustment: 0,
+          state: 'normal',
+          ratio
+        };
+      }
+
+      if (ratio <= 1.5) {
+        return {
+          adjustment: -1,
+          state: 'slightly_above',
+          ratio
+        };
+      }
+
+      if (ratio <= 2) {
+        return {
+          adjustment: -3,
+          state: 'high',
+          ratio
+        };
+      }
+
+      return {
+        adjustment: -5,
+        state: 'very_high',
+        ratio
+      };
+    }
+
+    const patterns =
+      scoringConfig.patterns || {};
+
+    const orderValue =
+      patterns.orderValue || null;
+
+    const relativeConfig =
+      orderValue?.relativeToHistory || null;
+
+    /*
+     * Admin can disable:
+     * - all Patterns;
+     * - Order Value;
+     * - Relative To History specifically.
+     */
     if (
-      orderCount < 3 ||
+      patterns.enabled === false ||
+      !orderValue ||
+      orderValue.enabled === false ||
+      !relativeConfig ||
+      relativeConfig.enabled === false
+    ) {
+      return {
+        adjustment: 0,
+        state: 'disabled',
+        ratio: null
+      };
+    }
+
+    const minimumHistoricalOrders =
+      Number.isFinite(
+        relativeConfig.minimumHistoricalOrders
+      )
+        ? relativeConfig.minimumHistoricalOrders
+        : 3;
+
+    if (
+      orderCount <
+        minimumHistoricalOrders ||
       !Number.isFinite(average) ||
       average <= 0 ||
       !Number.isFinite(current)
@@ -1051,41 +1151,75 @@ class AIScoringService {
     const ratio =
       current / average;
 
-    if (ratio < 0.5) {
-      return {
-        adjustment: -1,
-        state: 'very_low',
-        ratio
-      };
+    const rules =
+      Array.isArray(
+        relativeConfig.rules
+      )
+        ? relativeConfig.rules
+        : [];
+
+    const enabledRules =
+      rules
+        .filter(
+          rule =>
+            rule.enabled !== false
+        )
+        .sort(
+          (a, b) =>
+            Number(a.order || 0) -
+            Number(b.order || 0)
+        );
+
+    for (const rule of enabledRules) {
+      const hasMin =
+        Number.isFinite(rule.min);
+
+      const hasMax =
+        Number.isFinite(rule.max);
+
+      const minMatches =
+        !hasMin ||
+        (
+          rule.includeMin === false
+            ? ratio > rule.min
+            : ratio >= rule.min
+        );
+
+      const maxMatches =
+        !hasMax ||
+        (
+          rule.includeMax === false
+            ? ratio < rule.max
+            : ratio <= rule.max
+        );
+
+      if (
+        minMatches &&
+        maxMatches
+      ) {
+        return {
+          adjustment:
+            Number.isFinite(rule.impact)
+              ? rule.impact
+              : 0,
+
+          state:
+            rule.key ||
+            'matched',
+
+          ratio
+        };
+      }
     }
 
-    if (ratio <= 1.25) {
-      return {
-        adjustment: 0,
-        state: 'normal',
-        ratio
-      };
-    }
-
-    if (ratio <= 1.5) {
-      return {
-        adjustment: -1,
-        state: 'slightly_above',
-        ratio
-      };
-    }
-
-    if (ratio <= 2) {
-      return {
-        adjustment: -3,
-        state: 'high',
-        ratio
-      };
-    }
-
+    /*
+     * The activation validator should prevent gaps.
+     * If a malformed config still reaches the engine,
+     * fail safely without changing the score.
+     */
     return {
-      adjustment: -5,
-      state: 'very_high',
+      adjustment: 0,
+      state: 'unmatched',
       ratio
     };
   }
@@ -1265,7 +1399,8 @@ class AIScoringService {
     const amountHistory =
       this.calculateOrderAmountHistoryAdjustment(
         order.totalAmount,
-        context.orderValueHistory
+        context.orderValueHistory,
+        scoringConfig
       );
 
     score +=
