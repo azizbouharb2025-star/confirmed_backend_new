@@ -5,6 +5,8 @@ const logger = require('../utils/logger');
 const { emitOrderUpdate, emitOrderNew, emitOrderDelete } = require('../websocket/orderEvents');
 const { logActivity } = require('./activityLogService');
 const aiScoringService = require('./aiScoringService');
+const aiScoringConfigService =
+  require('./aiScoringConfigService');
 
 class OrderService {
   /**
@@ -998,6 +1000,171 @@ class OrderService {
 
 
   /**
+   * Build the OLD operatorFeedback fields only for
+   * compatibility with existing UI / analytics.
+   *
+   * IMPORTANT:
+   * these lists are NOT AI scoring rules.
+   *
+   * New questions or answers configured by Admin remain
+   * fully available in operatorFeedback.dynamic even when
+   * they have no equivalent in the historical schema.
+   */
+  buildLegacyOperatorFeedbackCompatibility(
+    responses = []
+  ) {
+    const responseByQuestion =
+      new Map(
+        (
+          Array.isArray(responses)
+            ? responses
+            : []
+        ).map(
+          response => [
+            response.questionKey,
+            Array.isArray(
+              response.answerKeys
+            )
+              ? response.answerKeys
+              : []
+          ]
+        )
+      );
+
+    /*
+     * These values mirror the historical Order schema
+     * enums only. They do NOT control dynamic scoring.
+     */
+    const allowedAnswers = {
+      tone_behavior:
+        new Set([
+          'polite',
+          'confident',
+          'enthusiastic',
+          'quick_response',
+          'hesitant',
+          'distracted',
+          'long_pauses',
+          'rude',
+          'aggressive',
+          'nervous',
+          'low_interest'
+        ]),
+
+      confirmation_level:
+        new Set([
+          'very_firm',
+          'normal',
+          'weak'
+        ]),
+
+      price_behavior:
+        new Set([
+          'no_issue',
+          'asks_discount',
+          'insists_discount',
+          'strong_negotiation'
+        ]),
+
+      product_doubts:
+        new Set([
+          'none',
+          'asks_question',
+          'multiple_doubts',
+          'compares_seller'
+        ]),
+
+      delivery_information:
+        new Set([
+          'complete_quick',
+          'clear_precise',
+          'partial',
+          'vague',
+          'difficulty',
+          'refuses_details'
+        ]),
+
+      engagement_level:
+        new Set([
+          'very_engaged',
+          'interested',
+          'passive',
+          'low_involvement',
+          'distracted'
+        ]),
+
+      reception_intent:
+        new Set([
+          'no_information',
+          'wants_fast_delivery',
+          'clearly_confirms_receipt',
+          'asks_delivery_info',
+          'uncertain_receipt',
+          'does_not_know_when'
+        ])
+    };
+
+    const compatibleAnswers =
+      questionKey =>
+        (
+          responseByQuestion.get(
+            questionKey
+          ) || []
+        ).filter(
+          answerKey =>
+            allowedAnswers[
+              questionKey
+            ]?.has(
+              answerKey
+            )
+        );
+
+    const compatibleFirst =
+      questionKey =>
+        compatibleAnswers(
+          questionKey
+        )[0];
+
+    return {
+      toneSignals:
+        compatibleAnswers(
+          'tone_behavior'
+        ),
+
+      confirmationLevel:
+        compatibleFirst(
+          'confirmation_level'
+        ),
+
+      priceBehavior:
+        compatibleFirst(
+          'price_behavior'
+        ),
+
+      productDoubts:
+        compatibleFirst(
+          'product_doubts'
+        ),
+
+      deliveryInformation:
+        compatibleFirst(
+          'delivery_information'
+        ),
+
+      engagementLevel:
+        compatibleFirst(
+          'engagement_level'
+        ),
+
+      receptionIntent:
+        compatibleFirst(
+          'reception_intent'
+        )
+    };
+  }
+
+
+  /**
    * Confirmer une commande après saisie du
    * Retour opérateur structuré.
    *
@@ -1104,9 +1271,24 @@ class OrderService {
         : undefined;
 
     /*
+     * Load the scoring configuration ONCE.
+     *
+     * Dynamic feedback validation, historical snapshot and
+     * final AI scoring will all reuse this exact version.
+     */
+    const scoringConfigContext =
+      await aiScoringConfigService
+        .getActiveScoringContext();
+
+    const usesDynamicResponses =
+      Array.isArray(
+        feedback.responses
+      );
+
+    /*
      * Compatibilité avec les analytics historiques.
      *
-     * Ce mapping n'est PAS une pondération du Score IA.
+     * This is not an AI scoring weight.
      */
     const confidenceCompatibility = {
       very_firm: 'strong',
@@ -1114,50 +1296,136 @@ class OrderService {
       weak: 'doubtful'
     };
 
-    const structuredFeedback = {
-      toneSignals:
-        Array.isArray(feedback.toneSignals)
-          ? feedback.toneSignals
-          : [],
+    let structuredFeedback;
+    let dynamicFeedback;
 
-      confirmationLevel:
-        feedback.confirmationLevel,
+    if (usesDynamicResponses) {
+      /*
+       * NEW dynamic payload.
+       *
+       * First validate questionKey/answerKeys against the
+       * exact active configuration.
+       */
+      const validation =
+        aiScoringService
+          .validateOperatorFeedbackResponses(
+            feedback.responses,
+            scoringConfigContext.config
+          );
 
-      priceBehavior:
-        feedback.priceBehavior,
+      if (!validation.valid) {
+        const error = new Error(
+          validation.errors.join(' | ')
+        );
 
-      productDoubts:
-        feedback.productDoubts,
+        error.statusCode = 400;
+        error.details =
+          validation.errors;
 
-      deliveryInformation:
-        feedback.deliveryInformation,
+        throw error;
+      }
 
-      engagementLevel:
-        feedback.engagementLevel,
+      /*
+       * Build a small compatibility representation for
+       * existing analytics/UI fields.
+       *
+       * If Admin later adds completely new questions they
+       * simply won't have a legacy equivalent, but they are
+       * still preserved in dynamicFeedback.
+       */
+      const legacyCompatibility =
+        this
+          .buildLegacyOperatorFeedbackCompatibility(
+            validation.responses
+          );
 
-      receptionIntent:
-        feedback.receptionIntent,
+      structuredFeedback = {
+        ...legacyCompatibility,
 
-      notes:
-        typeof feedback.notes === 'string'
-          ? feedback.notes.trim()
-          : ''
-    };
+        notes:
+          typeof feedback.notes ===
+            'string'
+            ? feedback.notes.trim()
+            : ''
+      };
+
+      dynamicFeedback =
+        aiScoringService
+          .buildDynamicOperatorFeedbackSnapshot(
+            validation.responses,
+            scoringConfigContext.config,
+            scoringConfigContext
+              .config?.version ?? null
+          );
+    } else {
+      /*
+       * EXISTING frontend payload.
+       *
+       * Keep the exact existing fields while also creating
+       * the V3 dynamic historical snapshot.
+       */
+      structuredFeedback = {
+        toneSignals:
+          Array.isArray(
+            feedback.toneSignals
+          )
+            ? feedback.toneSignals
+            : [],
+
+        confirmationLevel:
+          feedback.confirmationLevel,
+
+        priceBehavior:
+          feedback.priceBehavior,
+
+        productDoubts:
+          feedback.productDoubts,
+
+        deliveryInformation:
+          feedback.deliveryInformation,
+
+        engagementLevel:
+          feedback.engagementLevel,
+
+        receptionIntent:
+          feedback.receptionIntent,
+
+        notes:
+          typeof feedback.notes ===
+            'string'
+            ? feedback.notes.trim()
+            : ''
+      };
+
+      dynamicFeedback =
+        aiScoringService
+          .buildOperatorFeedbackSnapshot(
+            structuredFeedback,
+            scoringConfigContext.config,
+            scoringConfigContext
+              .config?.version ?? null
+          );
+    }
 
     order.operatorFeedback = {
       confidence:
         confidenceCompatibility[
-          feedback.confirmationLevel
+          structuredFeedback
+            .confirmationLevel
         ],
 
       ...structuredFeedback,
+
+      dynamic:
+        dynamicFeedback,
 
       operatorId,
       submittedAt: now
     };
 
     /*
-     * Snapshot complet dans l'historique d'appel.
+     * Keep the exact historical feedback snapshot in the
+     * call history as well.
      */
     order.callHistory.push({
       operatorId,
@@ -1165,8 +1433,14 @@ class OrderService {
       timestamp: now,
       duration: callDuration,
       result: 'confirmed',
-      notes: structuredFeedback.notes,
-      feedback: structuredFeedback
+      notes:
+        structuredFeedback.notes,
+
+      feedback: {
+        ...structuredFeedback,
+        dynamic:
+          dynamicFeedback
+      }
     });
 
     order.status = 'confirmed';
@@ -1193,7 +1467,10 @@ class OrderService {
      * pondération comportementale : on déclenche donc
      * son recalcul existant sans inventer de coefficients.
      */
-    await aiScoringService.enrichOrder(order);
+    await aiScoringService.enrichOrder(
+      order,
+      scoringConfigContext
+    );
 
     await order.save();
 

@@ -23,6 +23,48 @@ class AIScoringService {
     }
 
     /*
+     * Dynamic feedback snapshot.
+     *
+     * If this order already contains the exact feedback
+     * impact calculated from its historical scoring
+     * configuration, reuse that stored value.
+     *
+     * This prevents future Admin changes from modifying
+     * the behavioral impact of an old order.
+     */
+    if (
+      feedback.dynamic &&
+      feedback.dynamic.enabled !== false &&
+      Number.isFinite(
+        feedback.dynamic.totalImpact
+      )
+    ) {
+      const adjustment =
+        feedback.dynamic.totalImpact;
+
+      return {
+        adjustment,
+
+        applied:
+          adjustment !== 0,
+
+        summary:
+          adjustment > 0
+            ? 'Retour opérateur globalement favorable'
+            : adjustment < 0
+              ? 'Retour opérateur présentant des signaux de vigilance'
+              : 'Retour opérateur globalement neutre',
+
+        source:
+          'dynamic_snapshot',
+
+        configVersion:
+          feedback.dynamic
+            .configVersion ?? null
+      };
+    }
+
+    /*
      * PDF Scoring IA :
      * maximum 3 observations de ton/comportement.
      *
@@ -151,6 +193,735 @@ class AIScoringService {
           : raw < 0
             ? 'Retour opérateur présentant des signaux de vigilance'
             : 'Retour opérateur globalement neutre'
+    };
+  }
+
+
+  /**
+   * Build an immutable snapshot of the operator feedback
+   * using the scoring configuration used for the order.
+   *
+   * IMPORTANT:
+   * this method does NOT replace the historical scoring
+   * function yet.
+   *
+   * It only prepares the dynamic representation that will
+   * be stored with the order for history/versioning.
+   */
+  /**
+   * Validate dynamic operator-feedback responses against
+   * the currently selected scoring configuration.
+   *
+   * Expected payload:
+   *
+   * [
+   *   {
+   *     questionKey: 'tone_behavior',
+   *     answerKeys: ['polite', 'confident']
+   *   }
+   * ]
+   *
+   * This function only validates and normalizes.
+   * It does NOT save anything and does NOT change scoring.
+   */
+  validateOperatorFeedbackResponses(
+    responses,
+    scoringConfig = null
+  ) {
+    const feedbackConfig =
+      scoringConfig?.operatorFeedback ||
+      null;
+
+    const errors = [];
+
+    if (
+      !feedbackConfig ||
+      feedbackConfig.enabled === false
+    ) {
+      if (
+        Array.isArray(responses) &&
+        responses.length > 0
+      ) {
+        errors.push(
+          'Operator feedback is currently disabled.'
+        );
+      }
+
+      return {
+        valid: errors.length === 0,
+        errors,
+        responses: []
+      };
+    }
+
+    if (!Array.isArray(responses)) {
+      return {
+        valid: false,
+        errors: [
+          'responses must be an array.'
+        ],
+        responses: []
+      };
+    }
+
+    const activeCategoryKeys =
+      new Set(
+        (
+          Array.isArray(
+            feedbackConfig.categories
+          )
+            ? feedbackConfig.categories
+            : []
+        )
+          .filter(
+            category =>
+              category.active !== false
+          )
+          .map(
+            category =>
+              category.key
+          )
+      );
+
+    const activeQuestions =
+      (
+        Array.isArray(
+          feedbackConfig.questions
+        )
+          ? feedbackConfig.questions
+          : []
+      )
+        .filter(
+          question =>
+            question.active !== false &&
+            activeCategoryKeys.has(
+              question.categoryKey
+            )
+        );
+
+    const questionByKey =
+      new Map(
+        activeQuestions.map(
+          question => [
+            question.key,
+            question
+          ]
+        )
+      );
+
+    const normalizedResponses = [];
+    const seenQuestions = new Set();
+
+    for (
+      const response
+      of responses
+    ) {
+      const questionKey =
+        String(
+          response?.questionKey || ''
+        ).trim();
+
+      if (!questionKey) {
+        errors.push(
+          'Every response requires questionKey.'
+        );
+        continue;
+      }
+
+      if (
+        seenQuestions.has(
+          questionKey
+        )
+      ) {
+        errors.push(
+          `Duplicate response for question "${questionKey}".`
+        );
+        continue;
+      }
+
+      seenQuestions.add(
+        questionKey
+      );
+
+      const question =
+        questionByKey.get(
+          questionKey
+        );
+
+      if (!question) {
+        errors.push(
+          `Question "${questionKey}" is unknown or inactive.`
+        );
+        continue;
+      }
+
+      const rawAnswerKeys =
+        Array.isArray(
+          response?.answerKeys
+        )
+          ? response.answerKeys
+          : [];
+
+      const answerKeys =
+        [
+          ...new Set(
+            rawAnswerKeys
+              .map(
+                value =>
+                  String(
+                    value || ''
+                  ).trim()
+              )
+              .filter(Boolean)
+          )
+        ];
+
+      if (
+        answerKeys.length === 0
+      ) {
+        errors.push(
+          `Question "${questionKey}" requires at least one answer.`
+        );
+        continue;
+      }
+
+      if (
+        question.type ===
+          'single_choice' &&
+        answerKeys.length !== 1
+      ) {
+        errors.push(
+          `Question "${questionKey}" accepts exactly one answer.`
+        );
+        continue;
+      }
+
+      if (
+        question.type ===
+          'multiple_choice'
+      ) {
+        const maxSelections =
+          Number(
+            question.maxSelections
+          );
+
+        if (
+          Number.isFinite(
+            maxSelections
+          ) &&
+          maxSelections > 0 &&
+          answerKeys.length >
+            maxSelections
+        ) {
+          errors.push(
+            `Question "${questionKey}" accepts at most ${maxSelections} answers.`
+          );
+          continue;
+        }
+      }
+
+      const activeAnswers =
+        new Map(
+          (
+            Array.isArray(
+              question.answers
+            )
+              ? question.answers
+              : []
+          )
+            .filter(
+              answer =>
+                answer.active !== false
+            )
+            .map(
+              answer => [
+                answer.key,
+                answer
+              ]
+            )
+        );
+
+      const invalidAnswers =
+        answerKeys.filter(
+          answerKey =>
+            !activeAnswers.has(
+              answerKey
+            )
+        );
+
+      if (
+        invalidAnswers.length > 0
+      ) {
+        errors.push(
+          `Question "${questionKey}" contains unknown or inactive answer(s): ${invalidAnswers.join(', ')}.`
+        );
+        continue;
+      }
+
+      normalizedResponses.push({
+        questionKey,
+        answerKeys
+      });
+    }
+
+    const answeredQuestionKeys =
+      new Set(
+        normalizedResponses.map(
+          response =>
+            response.questionKey
+        )
+      );
+
+    for (
+      const question
+      of activeQuestions
+    ) {
+      if (
+        question.required === true &&
+        !answeredQuestionKeys.has(
+          question.key
+        )
+      ) {
+        errors.push(
+          `Required question "${question.key}" is missing.`
+        );
+      }
+    }
+
+    return {
+      valid:
+        errors.length === 0,
+
+      errors,
+
+      responses:
+        normalizedResponses
+    };
+  }
+
+
+  /**
+   * Build the historical snapshot for the NEW dynamic
+   * operator-feedback payload.
+   *
+   * responses must already have passed
+   * validateOperatorFeedbackResponses().
+   */
+  buildDynamicOperatorFeedbackSnapshot(
+    responses,
+    scoringConfig = null,
+    configVersion = null
+  ) {
+    const feedbackConfig =
+      scoringConfig?.operatorFeedback ||
+      null;
+
+    if (
+      !feedbackConfig ||
+      feedbackConfig.enabled === false
+    ) {
+      return {
+        configVersion:
+          Number.isFinite(configVersion)
+            ? configVersion
+            : scoringConfig?.version ?? null,
+
+        enabled: false,
+        totalImpact: 0,
+        responses: []
+      };
+    }
+
+    const questions =
+      Array.isArray(
+        feedbackConfig.questions
+      )
+        ? feedbackConfig.questions
+        : [];
+
+    const questionByKey =
+      new Map(
+        questions.map(
+          question => [
+            question.key,
+            question
+          ]
+        )
+      );
+
+    const snapshotResponses = [];
+    let totalImpact = 0;
+
+    for (
+      const response
+      of Array.isArray(responses)
+        ? responses
+        : []
+    ) {
+      const question =
+        questionByKey.get(
+          response.questionKey
+        );
+
+      /*
+       * Normally impossible after validation,
+       * but keep this builder defensive.
+       */
+      if (
+        !question ||
+        question.active === false
+      ) {
+        continue;
+      }
+
+      const answerByKey =
+        new Map(
+          (
+            Array.isArray(
+              question.answers
+            )
+              ? question.answers
+              : []
+          ).map(
+            answer => [
+              answer.key,
+              answer
+            ]
+          )
+        );
+
+      const answers = [];
+      let questionImpact = 0;
+
+      for (
+        const answerKey
+        of response.answerKeys || []
+      ) {
+        const answer =
+          answerByKey.get(
+            answerKey
+          );
+
+        if (
+          !answer ||
+          answer.active === false
+        ) {
+          continue;
+        }
+
+        const appliedImpact =
+          Number.isFinite(
+            answer.impact
+          )
+            ? answer.impact
+            : 0;
+
+        questionImpact +=
+          appliedImpact;
+
+        answers.push({
+          key:
+            answer.key,
+
+          label:
+            answer.label ||
+            answer.key,
+
+          configuredImpact:
+            appliedImpact,
+
+          appliedImpact,
+
+          active: true,
+          recognized: true
+        });
+      }
+
+      totalImpact +=
+        questionImpact;
+
+      snapshotResponses.push({
+        questionKey:
+          question.key,
+
+        questionTitle:
+          question.title ||
+          question.key,
+
+        questionPrompt:
+          question.prompt || '',
+
+        categoryKey:
+          question.categoryKey ||
+          null,
+
+        type:
+          question.type,
+
+        required:
+          question.required === true,
+
+        maxSelections:
+          Number.isFinite(
+            question.maxSelections
+          )
+            ? question.maxSelections
+            : null,
+
+        answerKeys:
+          answers.map(
+            answer => answer.key
+          ),
+
+        answers,
+
+        impact:
+          questionImpact
+      });
+    }
+
+    return {
+      configVersion:
+        Number.isFinite(configVersion)
+          ? configVersion
+          : scoringConfig?.version ?? null,
+
+      enabled: true,
+      totalImpact,
+      responses:
+        snapshotResponses
+    };
+  }
+
+
+  buildOperatorFeedbackSnapshot(
+    feedback,
+    scoringConfig = null,
+    configVersion = null
+  ) {
+    const feedbackConfig =
+      scoringConfig?.operatorFeedback ||
+      null;
+
+    if (
+      !feedbackConfig ||
+      feedbackConfig.enabled === false
+    ) {
+      return {
+        configVersion:
+          Number.isFinite(configVersion)
+            ? configVersion
+            : scoringConfig?.version ?? null,
+
+        enabled: false,
+        totalImpact: 0,
+        responses: []
+      };
+    }
+
+    /*
+     * Temporary compatibility bridge between the current
+     * fixed operator form and the new dynamic question
+     * keys stored in AIScoringConfig.
+     *
+     * This mapping disappears from the HTTP layer later
+     * when the frontend sends questionKey/answerKeys
+     * directly.
+     */
+    const legacyFieldByQuestionKey = {
+      tone_behavior:
+        'toneSignals',
+
+      confirmation_level:
+        'confirmationLevel',
+
+      price_behavior:
+        'priceBehavior',
+
+      product_doubts:
+        'productDoubts',
+
+      delivery_information:
+        'deliveryInformation',
+
+      engagement_level:
+        'engagementLevel',
+
+      reception_intent:
+        'receptionIntent'
+    };
+
+    const questions =
+      Array.isArray(
+        feedbackConfig.questions
+      )
+        ? feedbackConfig.questions
+        : [];
+
+    const responses = [];
+
+    let totalImpact = 0;
+
+    for (const question of questions) {
+      if (
+        !question ||
+        question.active === false
+      ) {
+        continue;
+      }
+
+      const legacyField =
+        legacyFieldByQuestionKey[
+          question.key
+        ];
+
+      if (!legacyField) {
+        continue;
+      }
+
+      const rawValue =
+        feedback?.[legacyField];
+
+      const selectedKeys =
+        Array.isArray(rawValue)
+          ? [
+              ...new Set(
+                rawValue
+                  .map(value =>
+                    String(value || '').trim()
+                  )
+                  .filter(Boolean)
+              )
+            ]
+          : rawValue
+            ? [
+                String(rawValue).trim()
+              ]
+            : [];
+
+      if (
+        selectedKeys.length === 0
+      ) {
+        continue;
+      }
+
+      const availableAnswers =
+        Array.isArray(question.answers)
+          ? question.answers
+          : [];
+
+      const answers = [];
+
+      let questionImpact = 0;
+
+      for (
+        const answerKey
+        of selectedKeys
+      ) {
+        const answer =
+          availableAnswers.find(
+            candidate =>
+              candidate?.key ===
+              answerKey
+          );
+
+        if (!answer) {
+          answers.push({
+            key: answerKey,
+            label: answerKey,
+            configuredImpact: 0,
+            appliedImpact: 0,
+            active: false,
+            recognized: false
+          });
+
+          continue;
+        }
+
+        const configuredImpact =
+          Number.isFinite(
+            answer.impact
+          )
+            ? answer.impact
+            : 0;
+
+        const appliedImpact =
+          answer.active === false
+            ? 0
+            : configuredImpact;
+
+        questionImpact +=
+          appliedImpact;
+
+        answers.push({
+          key:
+            answer.key,
+
+          label:
+            answer.label ||
+            answer.key,
+
+          configuredImpact,
+
+          appliedImpact,
+
+          active:
+            answer.active !== false,
+
+          recognized: true
+        });
+      }
+
+      totalImpact +=
+        questionImpact;
+
+      responses.push({
+        questionKey:
+          question.key,
+
+        questionTitle:
+          question.title ||
+          question.key,
+
+        questionPrompt:
+          question.prompt || '',
+
+        categoryKey:
+          question.categoryKey ||
+          null,
+
+        type:
+          question.type,
+
+        required:
+          question.required === true,
+
+        maxSelections:
+          Number.isFinite(
+            question.maxSelections
+          )
+            ? question.maxSelections
+            : null,
+
+        answerKeys:
+          selectedKeys,
+
+        answers,
+
+        impact:
+          questionImpact
+      });
+    }
+
+    return {
+      configVersion:
+        Number.isFinite(configVersion)
+          ? configVersion
+          : scoringConfig?.version ?? null,
+
+      enabled: true,
+      totalImpact,
+      responses
     };
   }
 
@@ -2525,15 +3296,23 @@ class AIScoringService {
   /**
    * Populate AI fields
    */
-  async enrichOrder(order) {
+  async enrichOrder(
+    order,
+    providedScoringConfigContext = null
+  ) {
     /*
-     * Load the active scoring configuration once for this
-     * entire scoring operation.
+     * Reuse a scoring configuration already loaded by the
+     * caller when available.
      *
-     * This prevents a single order from being calculated
-     * partly with one version and partly with another.
+     * This is important for operator feedback:
+     * validation, snapshot creation and final scoring must
+     * all use the exact same configuration version.
+     *
+     * Existing callers can still call enrichOrder(order)
+     * normally and the active config will be loaded here.
      */
     const scoringConfigContext =
+      providedScoringConfigContext ||
       await aiScoringConfigService
         .getActiveScoringContext();
 

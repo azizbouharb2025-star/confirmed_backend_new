@@ -393,6 +393,22 @@ const orderSchema = new mongoose.Schema({
       default: ''
     },
 
+    /*
+     * Snapshot dynamique du Retour opérateur.
+     *
+     * L'ancien format ci-dessus reste présent pour
+     * compatibilité avec le frontend et les analytics
+     * existants.
+     *
+     * Cette copie conserve les questions, réponses,
+     * impacts et la version de configuration utilisés
+     * au moment de la confirmation.
+     */
+    dynamic: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null
+    },
+
     operatorId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User'

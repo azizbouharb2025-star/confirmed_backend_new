@@ -1,6 +1,8 @@
 const express = require('express');
 const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 const Joi = require('joi');
+const aiScoringConfigService =
+  require('../services/aiScoringConfigService');
 const multer = require('multer');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
@@ -147,7 +149,7 @@ const operatorDetailsSchema = Joi.object({
 }).min(1);
 
 
-const operatorConfirmationSchema = Joi.object({
+const legacyOperatorConfirmationSchema = Joi.object({
   toneSignals: Joi.array()
     .items(
       Joi.string().valid(
@@ -240,6 +242,61 @@ const operatorConfirmationSchema = Joi.object({
     .optional()
 
 });
+
+/*
+ * New dynamic operator-feedback payload.
+ *
+ * Business validation against the active AI configuration
+ * is intentionally performed inside orderService so the
+ * same config version is reused for validation + scoring.
+ */
+const dynamicOperatorConfirmationSchema =
+  Joi.object({
+    responses: Joi.array()
+      .items(
+        Joi.object({
+          questionKey: Joi.string()
+            .trim()
+            .min(1)
+            .required(),
+
+          answerKeys: Joi.array()
+            .items(
+              Joi.string()
+                .trim()
+                .min(1)
+            )
+            .min(1)
+            .unique()
+            .required()
+        })
+      )
+      .required(),
+
+    notes: Joi.string()
+      .allow('')
+      .max(1500)
+      .optional(),
+
+    duration: Joi.number()
+      .integer()
+      .min(1)
+      .max(21600)
+      .optional()
+  });
+
+/*
+ * Temporary migration compatibility:
+ *
+ * - current frontend => legacy payload
+ * - future frontend  => dynamic payload
+ */
+const operatorConfirmationSchema =
+  Joi.alternatives().try(
+    legacyOperatorConfirmationSchema,
+    dynamicOperatorConfirmationSchema
+  );
+
 
 const operatorPostponeSchema = Joi.object({
   date: Joi.string()
@@ -588,6 +645,165 @@ router.get('/', auth, applyTierFilters(), async (req, res, next) => {
  * Get single order details with shop ownership validation
  * Requirements: 2.1, 2.2, 2.3
  */
+/**
+ * GET /api/orders/operator-feedback/questions
+ *
+ * Return the currently active operator-feedback form.
+ *
+ * Only active categories, questions and answers are
+ * exposed to the operator UI.
+ */
+router.get(
+  '/operator-feedback/questions',
+  auth,
+  async (req, res, next) => {
+    try {
+      const config =
+        await aiScoringConfigService
+          .getActiveConfig();
+
+      const feedbackConfig =
+        config?.operatorFeedback || null;
+
+      if (
+        !feedbackConfig ||
+        feedbackConfig.enabled === false
+      ) {
+        return res.json({
+          enabled: false,
+          configVersion:
+            config?.version ?? null,
+          categories: [],
+          questions: []
+        });
+      }
+
+      const activeCategories =
+        (
+          Array.isArray(
+            feedbackConfig.categories
+          )
+            ? feedbackConfig.categories
+            : []
+        )
+          .filter(
+            category =>
+              category.active !== false
+          )
+          .sort(
+            (a, b) =>
+              Number(a.order || 0) -
+              Number(b.order || 0)
+          )
+          .map(category => ({
+            key: category.key,
+            label: category.label,
+            order: category.order
+          }));
+
+      const activeCategoryKeys =
+        new Set(
+          activeCategories.map(
+            category => category.key
+          )
+        );
+
+      const questions =
+        (
+          Array.isArray(
+            feedbackConfig.questions
+          )
+            ? feedbackConfig.questions
+            : []
+        )
+          .filter(
+            question =>
+              question.active !== false &&
+              activeCategoryKeys.has(
+                question.categoryKey
+              )
+          )
+          .sort(
+            (a, b) =>
+              Number(a.order || 0) -
+              Number(b.order || 0)
+          )
+          .map(question => ({
+            key:
+              question.key,
+
+            categoryKey:
+              question.categoryKey,
+
+            title:
+              question.title,
+
+            prompt:
+              question.prompt,
+
+            type:
+              question.type,
+
+            required:
+              question.required === true,
+
+            maxSelections:
+              Number.isFinite(
+                question.maxSelections
+              )
+                ? question.maxSelections
+                : null,
+
+            order:
+              question.order,
+
+            answers:
+              (
+                Array.isArray(
+                  question.answers
+                )
+                  ? question.answers
+                  : []
+              )
+                .filter(
+                  answer =>
+                    answer.active !== false
+                )
+                .sort(
+                  (a, b) =>
+                    Number(a.order || 0) -
+                    Number(b.order || 0)
+                )
+                .map(answer => ({
+                  key:
+                    answer.key,
+
+                  label:
+                    answer.label,
+
+                  order:
+                    answer.order
+                }))
+          }));
+
+      return res.json({
+        enabled: true,
+
+        configVersion:
+          config.version,
+
+        categories:
+          activeCategories,
+
+        questions
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
 router.get('/:id', auth, async (req, res, next) => {
   try {
     const order = await orderService.findOrderById(req.params.id, req.user);
