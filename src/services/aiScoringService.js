@@ -535,8 +535,12 @@ class AIScoringService {
    * Cette définition reprend les contrôles d'adresse déjà
    * utilisés par CONFIRMED.
    */
-  calculateAddressAdjustment(order) {
-    const address = order.clientInfo?.address || {};
+  calculateAddressAdjustment(
+    order,
+    scoringConfig = null
+  ) {
+    const address =
+      order.clientInfo?.address || {};
 
     const street = String(
       address.street || ''
@@ -546,6 +550,13 @@ class AIScoringService {
       address.city || ''
     ).trim();
 
+    /*
+     * Governorate used by the historical/exclusive address
+     * quality logic.
+     *
+     * CONFIRMED may resolve it from other address data,
+     * so we preserve that historical behavior.
+     */
     const state = String(
       resolveTunisiaGovernorate(order) ||
       address.state ||
@@ -553,23 +564,181 @@ class AIScoringService {
       ''
     ).trim();
 
+    /*
+     * Governorate explicitly supplied with the order.
+     *
+     * In cumulative mode, City and Governorate are separate
+     * configurable components. A city must therefore not
+     * automatically earn the Governorate points as well.
+     */
+    const explicitGovernorate = String(
+      address.state ||
+      order.region ||
+      ''
+    ).trim();
+
+    const postalCode = String(
+      address.zipCode ||
+      address.postalCode ||
+      ''
+    ).trim();
+
+    /*
+     * Detect address quality exactly as the historical
+     * engine did.
+     *
+     * complete = street + city + governorate
+     * partial  = at least one of them
+     * missing  = none
+     */
+    let addressState = 'missing';
+
     if (street && city && state) {
+      addressState = 'complete';
+    } else if (
+      street ||
+      city ||
+      state
+    ) {
+      addressState = 'partial';
+    }
+
+    /*
+     * Safe historical fallback.
+     *
+     * calculateAIScore() can still be called without a
+     * database configuration, so the old behavior must
+     * remain available.
+     */
+    if (!scoringConfig) {
+      const historicalImpacts = {
+        complete: 6,
+        partial: -3,
+        missing: -10
+      };
+
       return {
-        adjustment: 6,
-        state: 'complete'
+        adjustment:
+          historicalImpacts[
+            addressState
+          ],
+        state: addressState
       };
     }
 
-    if (street || city || state) {
+    const patterns =
+      scoringConfig.patterns || {};
+
+    const addressConfig =
+      patterns.address || null;
+
+    /*
+     * The whole Pattern group or Address category can be
+     * disabled by the Admin.
+     */
+    if (
+      patterns.enabled === false ||
+      !addressConfig ||
+      addressConfig.enabled === false
+    ) {
       return {
-        adjustment: -3,
-        state: 'partial'
+        adjustment: 0,
+        state: addressState
       };
+    }
+
+    /*
+     * EXCLUSIVE MODE
+     *
+     * Apply only one level:
+     * complete / partial / missing.
+     */
+    if (
+      addressConfig.mode !==
+      'cumulative'
+    ) {
+      const levels =
+        Array.isArray(
+          addressConfig.levels
+        )
+          ? addressConfig.levels
+          : [];
+
+      const rule =
+        levels.find(
+          item =>
+            item.key ===
+            addressState
+        );
+
+      if (
+        !rule ||
+        rule.enabled === false ||
+        !Number.isFinite(
+          rule.impact
+        )
+      ) {
+        return {
+          adjustment: 0,
+          state: addressState
+        };
+      }
+
+      return {
+        adjustment:
+          rule.impact,
+        state: addressState
+      };
+    }
+
+    /*
+     * CUMULATIVE MODE
+     *
+     * Each enabled address component contributes its
+     * configured impact when that component is present.
+     */
+    const elements =
+      addressConfig.elements || {};
+
+    const componentValues = {
+      street,
+      city,
+      governorate:
+        explicitGovernorate,
+      postalCode
+    };
+
+    let adjustment = 0;
+
+    for (
+      const [
+        key,
+        value
+      ] of Object.entries(
+        componentValues
+      )
+    ) {
+      const rule =
+        elements[key];
+
+      if (
+        !value ||
+        !rule ||
+        rule.enabled === false ||
+        !Number.isFinite(
+          rule.impact
+        )
+      ) {
+        continue;
+      }
+
+      adjustment +=
+        rule.impact;
     }
 
     return {
-      adjustment: -10,
-      state: 'missing'
+      adjustment,
+      state: addressState
     };
   }
 
@@ -933,7 +1102,10 @@ class AIScoringService {
     // =====================================================
 
     const addressResult =
-      this.calculateAddressAdjustment(order);
+      this.calculateAddressAdjustment(
+        order,
+        scoringConfig
+      );
 
     score += addressResult.adjustment;
 
