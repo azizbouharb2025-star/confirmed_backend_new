@@ -5,6 +5,7 @@ const Order = require('../models/Order');
 const Subscription = require('../models/Subscription');
 const AIScoringConfig = require('../models/AIScoringConfig');
 const aiScoringConfigValidator = require('../services/aiScoringConfigValidationService');
+const aiScoringService = require('../services/aiScoringService');
 const { auth, authorize } = require('../middleware/auth');
 
 const router = express.Router();
@@ -2097,6 +2098,222 @@ router.post(
         });
       }
 
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * POST /api/admin/ai-scoring/configs/:version/simulate
+ *
+ * Run the real AI scoring engine against a temporary order.
+ *
+ * IMPORTANT:
+ * - no Order document is created;
+ * - no score is persisted;
+ * - no configuration is activated;
+ * - historical data is read only.
+ */
+router.post(
+  '/ai-scoring/configs/:version/simulate',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const version =
+        Number(req.params.version);
+
+      if (
+        !Number.isInteger(version) ||
+        version < 1
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration version'
+        });
+      }
+
+      const scoringConfig =
+        await AIScoringConfig
+          .findOne({
+            version
+          })
+          .select({
+            version: 1,
+            status: 1,
+            general: 1,
+            patterns: 1,
+            customerHistory: 1,
+            operatorFeedback: 1
+          })
+          .lean();
+
+      if (!scoringConfig) {
+        return res.status(404).json({
+          error:
+            'AI scoring configuration not found'
+        });
+      }
+
+      const input =
+        req.body?.order;
+
+      if (
+        !input ||
+        typeof input !== 'object' ||
+        Array.isArray(input)
+      ) {
+        return res.status(400).json({
+          error:
+            'A simulated order object is required'
+        });
+      }
+
+      const totalAmount =
+        Number(input.totalAmount);
+
+      if (
+        !Number.isFinite(totalAmount) ||
+        totalAmount < 0
+      ) {
+        return res.status(400).json({
+          error:
+            'Simulation totalAmount must be a non-negative number'
+        });
+      }
+
+      let createdAt =
+        new Date();
+
+      if (input.createdAt) {
+        createdAt =
+          new Date(input.createdAt);
+
+        if (
+          Number.isNaN(
+            createdAt.getTime()
+          )
+        ) {
+          return res.status(400).json({
+            error:
+              'Simulation createdAt is invalid'
+          });
+        }
+      }
+
+      /*
+       * Build only an in-memory order-like object.
+       * It is never saved through the Order model.
+       */
+      const simulatedOrder = {
+        shopId:
+          input.shopId || null,
+
+        clientInfo: {
+          name:
+            input.clientInfo?.name || '',
+
+          phone:
+            input.clientInfo?.phone || '',
+
+          address: {
+            street:
+              input.clientInfo
+                ?.address
+                ?.street || '',
+
+            city:
+              input.clientInfo
+                ?.address
+                ?.city || '',
+
+            state:
+              input.clientInfo
+                ?.address
+                ?.state || '',
+
+            zipCode:
+              input.clientInfo
+                ?.address
+                ?.zipCode || ''
+          }
+        },
+
+        region:
+          input.region || '',
+
+        totalAmount,
+
+        createdAt,
+
+        operatorFeedback:
+          input.operatorFeedback || null
+      };
+
+      /*
+       * Read historical context with the exact same service
+       * used by production scoring.
+       *
+       * Without shopId the service safely returns an empty
+       * historical context.
+       */
+      const context =
+        await aiScoringService
+          .buildScoringContext(
+            simulatedOrder
+          );
+
+      const result =
+        aiScoringService
+          .calculateAIScore(
+            simulatedOrder,
+            context,
+            scoringConfig
+          );
+
+      return res.json({
+        version:
+          scoringConfig.version,
+
+        status:
+          scoringConfig.status,
+
+        simulation: {
+          baseScore:
+            result.baseScore,
+
+          calculatedScore:
+            result.calculatedScore,
+
+          minimumScore:
+            result.minimumScore,
+
+          maximumScore:
+            result.maximumScore,
+
+          finalScore:
+            result.score,
+
+          factors:
+            result.factors || [],
+
+          riskLevel:
+            aiScoringService
+              .calculateRiskLevel(
+                result.score
+              ),
+
+          decision:
+            aiScoringService
+              .calculateDecision(
+                result.score
+              )
+        },
+
+        context
+      });
+    } catch (error) {
       next(error);
     }
   }
