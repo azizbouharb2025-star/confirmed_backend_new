@@ -1739,6 +1739,46 @@ router.patch('/users/:userId/subscription', auth, authorize('admin'), async (req
 // ==========================================================
 
 /**
+ * GET /api/admin/ai-scoring/shops
+ *
+ * Return active shops for the AI scoring simulator.
+ */
+router.get(
+  '/ai-scoring/shops',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const shops =
+        await Shop
+          .find({
+            isActive: true
+          })
+          .select({
+            _id: 1,
+            name: 1
+          })
+          .sort({
+            name: 1
+          })
+          .lean();
+
+      return res.json({
+        shops: shops.map(
+          shop => ({
+            id: String(shop._id),
+            name: shop.name
+          })
+        )
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+/**
  * GET /api/admin/ai-scoring/configs
  * List all scoring configuration versions.
  */
@@ -1981,6 +2021,82 @@ router.put(
         });
       }
 
+      next(error);
+    }
+  }
+);
+
+
+/**
+ * DELETE /api/admin/ai-scoring/configs/:version
+ *
+ * Delete one draft configuration.
+ * Active and archived configurations are protected.
+ */
+router.delete(
+  '/ai-scoring/configs/:version',
+  auth,
+  authorize('admin'),
+  async (req, res, next) => {
+    try {
+      const version =
+        Number(req.params.version);
+
+      if (
+        !Number.isInteger(version) ||
+        version < 1
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid AI scoring configuration version'
+        });
+      }
+
+      const config =
+        await AIScoringConfig
+          .findOne({
+            version
+          })
+          .select({
+            _id: 1,
+            version: 1,
+            status: 1
+          })
+          .lean();
+
+      if (!config) {
+        return res.status(404).json({
+          error:
+            'AI scoring configuration not found'
+        });
+      }
+
+      if (config.status !== 'draft') {
+        return res.status(409).json({
+          error:
+            'Only draft AI scoring configurations can be deleted'
+        });
+      }
+
+      const deletion =
+        await AIScoringConfig.deleteOne({
+          _id: config._id,
+          status: 'draft'
+        });
+
+      if (deletion.deletedCount !== 1) {
+        return res.status(409).json({
+          error:
+            'AI scoring draft could not be deleted'
+        });
+      }
+
+      return res.json({
+        message:
+          `AI scoring draft V${version} deleted`,
+        version
+      });
+    } catch (error) {
       next(error);
     }
   }

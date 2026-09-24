@@ -979,15 +979,33 @@ class AIScoringService {
      * 0021622123456
      * 22 123 456
      */
-    const customerPhoneIdentity =
-      normalizeCustomerPhoneIdentity(
-        order.clientInfo?.phone
-      );
+    const additionalPhones =
+      Array.isArray(
+        order.clientInfo?.additionalPhones
+      )
+        ? order.clientInfo.additionalPhones
+        : [];
 
-    const customerPhoneRegex =
-      buildCustomerPhoneRegex(
-        customerPhoneIdentity
-      );
+    /*
+     * L'identité client peut venir du téléphone principal,
+     * d'un numéro supplémentaire ou du téléphone secondaire.
+     */
+    const customerPhoneIdentities = [
+      order.clientInfo?.phone,
+      ...additionalPhones,
+      order.deliveryInfo?.secondaryPhone
+    ]
+      .map(normalizeCustomerPhoneIdentity)
+      .filter(Boolean);
+
+    const uniqueCustomerPhoneIdentities = [
+      ...new Set(customerPhoneIdentities)
+    ];
+
+    const customerPhoneRegexes =
+      uniqueCustomerPhoneIdentities
+        .map(buildCustomerPhoneRegex)
+        .filter(Boolean);
 
     const shopId =
       order.shopId?._id ||
@@ -1015,19 +1033,31 @@ class AIScoringService {
     // HISTORIQUE CLIENT + HABITUDES DE MONTANT
     // ======================================================
 
-    if (
-      customerPhoneIdentity &&
-      customerPhoneRegex
-    ) {
+    if (customerPhoneRegexes.length > 0) {
+      const phoneFields = [
+        'clientInfo.phone',
+        'clientInfo.additionalPhones',
+        'deliveryInfo.secondaryPhone'
+      ];
+
       const customerQuery = {
         ...baseShopQuery,
 
         /*
-         * Match historical formatting variants without
-         * rewriting old orders in MongoDB.
+         * Chaque téléphone actuel est recherché dans tous
+         * les champs historiques, sans réécrire MongoDB.
+         *
+         * Une commande qui correspond à plusieurs numéros
+         * reste comptée une seule fois grâce au même $or.
          */
-        'clientInfo.phone':
-          customerPhoneRegex
+        $or: customerPhoneRegexes.flatMap(
+          phoneRegex =>
+            phoneFields.map(
+              field => ({
+                [field]: phoneRegex
+              })
+            )
+        )
       };
 
       const [
