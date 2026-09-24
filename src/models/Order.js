@@ -79,7 +79,21 @@ const orderSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['pending', 'assigned', 'in_progress', 'confirmed', 'rejected', 'cancelled', 'postponed', 'shipped', 'delivered', 'failed_delivery'],
+    enum: [
+      'pending',
+      'assigned',
+      'in_progress',
+      'confirmed',
+      'rejected',
+      'cancelled',
+      'postponed',
+      'shipped',
+      'at_depot',
+      'out_for_delivery',
+      'delivered',
+      'returned',
+      'failed_delivery'
+    ],
     default: 'pending'
   },
 
@@ -498,7 +512,10 @@ const orderSchema = new mongoose.Schema({
         'cancelled',
         'postponed',
         'shipped',
+        'at_depot',
+        'out_for_delivery',
         'delivered',
+        'returned',
         'failed_delivery'
       ]
     },

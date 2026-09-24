@@ -81,6 +81,40 @@ const deliveryShipmentSchema = new mongoose.Schema({
   },
 
   /*
+   * Historique brut des statuts retournés par le transporteur.
+   *
+   * providerStatusCode / providerStatusLabel restent
+   * le dernier état connu.
+   *
+   * providerStatusHistory conserve la chronologie complète
+   * nécessaire au suivi et à l'audit.
+   */
+  providerStatusHistory: [{
+    code: {
+      type: mongoose.Schema.Types.Mixed
+    },
+
+    label: {
+      type: String,
+      trim: true
+    },
+
+    mappedOrderStatus: {
+      type: String,
+      trim: true
+    },
+
+    occurredAt: {
+      type: Date,
+      default: Date.now
+    },
+
+    rawEvent: {
+      type: mongoose.Schema.Types.Mixed
+    }
+  }],
+
+  /*
    * Métadonnées non sensibles propres au transporteur.
    * Ex. Intigo :
    * {

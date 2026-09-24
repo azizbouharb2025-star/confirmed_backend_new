@@ -44,8 +44,8 @@ const mapIntigoStatus = statusValue => {
   }
 
   /*
-   * Réacheminement :
-   * le colis continue son cycle.
+   * 99 - Réacheminement.
+   * Le colis reste dans le processus de livraison.
    */
   if (status === 99) {
     return {
@@ -56,7 +56,7 @@ const mapIntigoStatus = statusValue => {
         'rerouting',
 
       orderStatus:
-        null,
+        'out_for_delivery',
 
       requiresReview:
         false
@@ -64,10 +64,10 @@ const mapIntigoStatus = statusValue => {
   }
 
   /*
-   * Pickup vendeur.
+   * 1000 à 1008 - Pickup vendeur.
    *
-   * Le colis n'est pas encore considéré
-   * comme expédié dans Confirmed.
+   * Après création/export réel du colis, CONFIRMED
+   * considère la commande comme expédiée.
    */
   if (
     status >= 1000 &&
@@ -81,7 +81,7 @@ const mapIntigoStatus = statusValue => {
         'pickup',
 
       orderStatus:
-        null,
+        'shipped',
 
       requiresReview:
         false
@@ -89,7 +89,7 @@ const mapIntigoStatus = statusValue => {
   }
 
   /*
-   * Annulation pendant pickup.
+   * 1100 à 1102 - Annulation pendant pickup.
    */
   if (
     status >= 1100 &&
@@ -111,10 +111,8 @@ const mapIntigoStatus = statusValue => {
   }
 
   /*
-   * Entrepôt / relance / vérification.
-   *
-   * Le transporteur possède physiquement
-   * le colis : Confirmed => shipped.
+   * 2000 / 2001 / 2004 / 2100
+   * Entrepôt, relance, reçu, vérification.
    */
   if (
     [
@@ -132,13 +130,16 @@ const mapIntigoStatus = statusValue => {
         'warehouse',
 
       orderStatus:
-        'shipped',
+        'at_depot',
 
       requiresReview:
         false
     };
   }
 
+  /*
+   * 3100 - Transfert vers livraison.
+   */
   if (status === 3100) {
     return {
       known:
@@ -148,13 +149,16 @@ const mapIntigoStatus = statusValue => {
         'delivery_transfer',
 
       orderStatus:
-        'shipped',
+        'out_for_delivery',
 
       requiresReview:
         false
     };
   }
 
+  /*
+   * 3201 - Transfert retour réel.
+   */
   if (status === 3201) {
     return {
       known:
@@ -164,13 +168,16 @@ const mapIntigoStatus = statusValue => {
         'return_transfer',
 
       orderStatus:
-        'failed_delivery',
+        'returned',
 
       requiresReview:
         false
     };
   }
 
+  /*
+   * 4000 - Chez le livreur / en livraison.
+   */
   if (status === 4000) {
     return {
       known:
@@ -180,13 +187,16 @@ const mapIntigoStatus = statusValue => {
         'out_for_delivery',
 
       orderStatus:
-        'shipped',
+        'out_for_delivery',
 
       requiresReview:
         false
     };
   }
 
+  /*
+   * 5000 - Livraison réussie.
+   */
   if (status === 5000) {
     return {
       known:
@@ -203,6 +213,10 @@ const mapIntigoStatus = statusValue => {
     };
   }
 
+  /*
+   * 6000 / 6001 / 6500 / 6900
+   * Processus réel de retour vers l'expéditeur.
+   */
   if (
     [
       6000,
@@ -219,13 +233,16 @@ const mapIntigoStatus = statusValue => {
         'return',
 
       orderStatus:
-        'failed_delivery',
+        'returned',
 
       requiresReview:
         false
     };
   }
 
+  /*
+   * 9000 à 9004 - Annulations définitives.
+   */
   if (
     status >= 9000 &&
     status <= 9004
@@ -246,8 +263,8 @@ const mapIntigoStatus = statusValue => {
   }
 
   /*
-   * Tout nouveau statut Intigo inconnu
-   * ne doit jamais modifier Order automatiquement.
+   * Tout statut Intigo inconnu est conservé
+   * techniquement mais ne modifie jamais Order.
    */
   return {
     known:
@@ -263,6 +280,7 @@ const mapIntigoStatus = statusValue => {
       true
   };
 };
+
 
 const evaluateOrderTransition = (
   currentStatus,
@@ -292,8 +310,11 @@ const evaluateOrderTransition = (
   }
 
   /*
-   * Statuts terminaux Confirmed :
-   * aucune régression automatique.
+   * Livrée / Annulée / Rejetée restent terminales.
+   *
+   * "returned" n'est volontairement PAS terminal :
+   * Intigo peut remettre réellement un colis dans
+   * le circuit logistique.
    */
   if (
     [
@@ -311,21 +332,59 @@ const evaluateOrderTransition = (
     };
   }
 
-  /*
-   * Seules les commandes déjà confirmées
-   * ou expédiées pourront être synchronisées.
-   */
   const allowed = {
     confirmed: [
       'shipped',
+      'at_depot',
+      'out_for_delivery',
       'delivered',
-      'failed_delivery',
+      'returned',
       'cancelled'
     ],
 
     shipped: [
+      'at_depot',
+      'out_for_delivery',
       'delivered',
-      'failed_delivery',
+      'returned',
+      'cancelled'
+    ],
+
+    at_depot: [
+      'out_for_delivery',
+      'delivered',
+      'returned',
+      'cancelled'
+    ],
+
+    out_for_delivery: [
+      'at_depot',
+      'delivered',
+      'returned',
+      'cancelled'
+    ],
+
+    /*
+     * Le dernier événement Intigo valide reste
+     * la source de vérité : un colis retourné peut
+     * repartir réellement en livraison.
+     */
+    returned: [
+      'at_depot',
+      'out_for_delivery',
+      'delivered',
+      'cancelled'
+    ],
+
+    /*
+     * Compatibilité avec les commandes historiques
+     * créées avec l'ancien mapping.
+     */
+    failed_delivery: [
+      'at_depot',
+      'out_for_delivery',
+      'delivered',
+      'returned',
       'cancelled'
     ]
   };
@@ -351,6 +410,7 @@ const evaluateOrderTransition = (
       'transition_allowed'
   };
 };
+
 
 const getIntigoShipmentStatusPreview =
   async ({
@@ -746,6 +806,110 @@ const syncIntigoShipmentStatus =
      * en state=cancelled, car cet état local est utilisé
      * par le moteur de réservation/retry.
      */
+    const shipmentUpdate = {
+      $set: {
+        providerStatusCode:
+          currentProviderStatusCode,
+
+        providerStatusLabel:
+          currentProviderStatusLabel,
+
+        'metadata.lastStatusSyncAt':
+          syncedAt,
+
+        'metadata.intigoLifecycle':
+          preview.mapping.lifecycle,
+
+        'metadata.intigoIsDelivered':
+          preview.intigo.isDelivered,
+
+        'metadata.intigoIsReturn':
+          preview.intigo.isReturn,
+
+        'metadata.intigoDeliveryAttempts':
+          preview.intigo
+            .deliveryAttempts,
+
+        'metadata.intigoUpdatedAt':
+          preview.intigo.updatedAt ||
+          null
+      }
+    };
+
+    /*
+     * Conserver chaque changement réel du statut
+     * transporteur indépendamment du statut métier.
+     */
+    if (providerStatusChanged) {
+      let providerOccurredAt =
+        syncedAt;
+
+      if (preview.intigo.updatedAt) {
+        const candidateDate =
+          new Date(
+            preview.intigo.updatedAt
+          );
+
+        if (
+          !Number.isNaN(
+            candidateDate.getTime()
+          )
+        ) {
+          providerOccurredAt =
+            candidateDate;
+        }
+      }
+
+      shipmentUpdate.$push = {
+        providerStatusHistory: {
+          code:
+            currentProviderStatusCode,
+
+          label:
+            currentProviderStatusLabel ||
+            undefined,
+
+          mappedOrderStatus:
+            preview.mapping
+              .proposedOrderStatus ||
+            undefined,
+
+          occurredAt:
+            providerOccurredAt,
+
+          rawEvent: {
+            nid:
+              preview.intigo.nid,
+
+            cid:
+              preview.intigo.cid ||
+              null,
+
+            status:
+              preview.intigo.status,
+
+            statusLabel:
+              preview.intigo.statusLabel ||
+              null,
+
+            isDelivered:
+              preview.intigo.isDelivered,
+
+            isReturn:
+              preview.intigo.isReturn,
+
+            deliveryAttempts:
+              preview.intigo
+                .deliveryAttempts,
+
+            updatedAt:
+              preview.intigo.updatedAt ||
+              null
+          }
+        }
+      };
+    }
+
     const shipment =
       await DeliveryShipment
         .findOneAndUpdate(
@@ -762,35 +926,7 @@ const syncIntigoShipmentStatus =
               preview.local.nid
           },
 
-          {
-            $set: {
-              providerStatusCode:
-                currentProviderStatusCode,
-
-              providerStatusLabel:
-                currentProviderStatusLabel,
-
-              'metadata.lastStatusSyncAt':
-                syncedAt,
-
-              'metadata.intigoLifecycle':
-                preview.mapping.lifecycle,
-
-              'metadata.intigoIsDelivered':
-                preview.intigo.isDelivered,
-
-              'metadata.intigoIsReturn':
-                preview.intigo.isReturn,
-
-              'metadata.intigoDeliveryAttempts':
-                preview.intigo
-                  .deliveryAttempts,
-
-              'metadata.intigoUpdatedAt':
-                preview.intigo.updatedAt ||
-                null
-            }
-          },
+          shipmentUpdate,
 
           {
             new:
