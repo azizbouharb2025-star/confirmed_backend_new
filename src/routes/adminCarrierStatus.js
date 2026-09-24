@@ -7,6 +7,11 @@ const carrierStatusConfigValidator =
   require('../services/carrierStatusConfigValidationService');
 
 const {
+  buildInitialCarrierStatusMappings
+} =
+  require('../services/carrierStatusDefaultConfigService');
+
+const {
   auth,
   authorize
 } = require('../middleware/auth');
@@ -22,6 +27,121 @@ const router = express.Router();
 router.use(
   auth,
   authorize('admin')
+);
+
+
+// ==========================================================
+// INITIALIZE FIRST DRAFT
+// ==========================================================
+
+router.post(
+  '/initialize',
+  async (req, res, next) => {
+    try {
+      const existing =
+        await CarrierStatusConfig
+          .findOne({})
+          .select({
+            _id: 1,
+            version: 1,
+            status: 1
+          })
+          .lean();
+
+      if (existing) {
+        return res.status(409).json({
+          error:
+            'Carrier status configuration already initialized',
+
+          existingVersion:
+            existing.version,
+
+          existingStatus:
+            existing.status
+        });
+      }
+
+      const config =
+        new CarrierStatusConfig({
+          version: 1,
+
+          status:
+            'draft',
+
+          mappings:
+            buildInitialCarrierStatusMappings(),
+
+          notes:
+            'Configuration initiale basée sur les mappings transporteurs existants.',
+
+          createdBy:
+            req.user._id,
+
+          activatedBy:
+            null,
+
+          activatedAt:
+            null,
+
+          clonedFromVersion:
+            null
+        });
+
+      await config.validate();
+
+      const validation =
+        carrierStatusConfigValidator
+          .validateForActivation(
+            config.toObject()
+          );
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          error:
+            'Initial carrier status configuration is invalid',
+
+          details:
+            validation.errors
+        });
+      }
+
+      await config.save();
+
+      return res.status(201).json({
+        message:
+          'Carrier status configuration V1 created as draft',
+
+        config
+      });
+    } catch (error) {
+      if (error?.code === 11000) {
+        return res.status(409).json({
+          error:
+            'Carrier status configuration initialization conflict'
+        });
+      }
+
+      if (
+        error?.name ===
+        'ValidationError'
+      ) {
+        return res.status(400).json({
+          error:
+            'Invalid initial carrier status configuration',
+
+          details:
+            Object.values(
+              error.errors || {}
+            ).map(
+              item =>
+                item.message
+            )
+        });
+      }
+
+      next(error);
+    }
+  }
 );
 
 
