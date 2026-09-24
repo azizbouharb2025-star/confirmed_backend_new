@@ -6,6 +6,8 @@ const DeliveryIntegration = require('../models/DeliveryIntegration');
 const DeliveryShipment = require('../models/DeliveryShipment');
 const Order = require('../models/Order');
 
+const orderService = require('../services/orderService');
+
 const {
   analyzeIntigoOrders,
   toPublicAnalysis,
@@ -42,6 +44,90 @@ const verifyOrderOwnership = async (orderId, user) => {
     return { valid: false, error: 'Access denied', status: 403 };
   }
   return { valid: true, order };
+};
+
+/**
+ * Synchronise le statut métier de la commande après
+ * création réelle et confirmée d'un colis transporteur.
+ *
+ * Important:
+ * - ne modifie que confirmed -> shipped
+ * - exige DeliveryShipment.state === created
+ * - une erreur de synchronisation locale ne doit jamais
+ *   provoquer un deuxième envoi vers le transporteur
+ */
+const markOrderShippedAfterLiveDispatch = async ({
+  shopId,
+  provider,
+  shipmentId,
+  user
+}) => {
+  try {
+    if (!shipmentId) {
+      return false;
+    }
+
+    const shipment =
+      await DeliveryShipment.findOne({
+        _id: shipmentId,
+        shopId,
+        provider,
+        state: 'created'
+      })
+        .select('orderId')
+        .lean();
+
+    if (!shipment?.orderId) {
+      return false;
+    }
+
+    const order =
+      await Order.findOne({
+        _id: shipment.orderId,
+        shopId
+      })
+        .select('_id status')
+        .lean();
+
+    /*
+     * Ne jamais écraser delivered/cancelled/etc.
+     * Seule une commande confirmée devient expédiée.
+     */
+    if (
+      !order ||
+      order.status !== 'confirmed'
+    ) {
+      return false;
+    }
+
+    const providerLabel =
+      provider === 'intigo'
+        ? 'Intigo'
+        : provider === 'colissimo'
+          ? 'Colissimo'
+          : provider;
+
+    await orderService.updateOrderStatus(
+      order._id,
+      'shipped',
+      `Colis créé avec succès chez ${providerLabel}.`,
+      user
+    );
+
+    return true;
+  } catch (error) {
+    /*
+     * Le transporteur peut déjà avoir créé le colis.
+     * Ne jamais faire échouer la réponse live ici,
+     * sinon l'utilisateur pourrait tenter un second dispatch.
+     */
+    console.error(
+      `[delivery] ${provider} created but order status sync failed:`,
+      error
+    );
+
+    return false;
+  }
 };
 
 const serializeIntegration = integration => {
@@ -653,6 +739,20 @@ router.post(
             req.body?.confirm
         });
 
+      await markOrderShippedAfterLiveDispatch({
+        shopId:
+          req.user.shopId,
+
+        provider:
+          'colissimo',
+
+        shipmentId:
+          result?.shipmentId,
+
+        user:
+          req.user
+      });
+
       return res
         .status(201)
         .json(result);
@@ -1152,6 +1252,20 @@ router.post(
           confirm:
             req.body?.confirm
         });
+
+      await markOrderShippedAfterLiveDispatch({
+        shopId:
+          req.user.shopId,
+
+        provider:
+          'intigo',
+
+        shipmentId:
+          result?.shipment?.id,
+
+        user:
+          req.user
+      });
 
       return res.status(201).json(
         result
