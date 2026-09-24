@@ -676,6 +676,54 @@ router.post(
         });
       }
 
+      /*
+       * Sécurité métier temporaire :
+       * "Retour dépôt" doit être explicitement décidé
+       * avant qu'une configuration puisse devenir active.
+       *
+       * Cela protège aussi les appels directs à l'API,
+       * pas uniquement l'interface Admin.
+       */
+      const hasResolvedRetourDepotMapping =
+        Array.isArray(
+          target.mappings?.colissimo
+        ) &&
+        target.mappings.colissimo.some(
+          mapping => {
+            const normalizedStatus =
+              String(
+                mapping.providerStatus || ''
+              )
+                .normalize('NFD')
+                .replace(
+                  /[\u0300-\u036f]/g,
+                  ''
+                )
+                .trim()
+                .toLowerCase();
+
+            return (
+              mapping.enabled !== false &&
+              normalizedStatus ===
+                'retour depot' &&
+              Boolean(
+                mapping.mappedOrderStatus
+              )
+            );
+          }
+        );
+
+      if (!hasResolvedRetourDepotMapping) {
+        return res.status(400).json({
+          error:
+            'Carrier status configuration cannot be activated',
+
+          details: [
+            'Colissimo "Retour dépôt" doit être explicitement associé à un statut CONFIRMED avant activation.'
+          ]
+        });
+      }
+
       const activeConfig =
         await CarrierStatusConfig
           .findOne({
