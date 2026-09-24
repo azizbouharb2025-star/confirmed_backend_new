@@ -6,6 +6,7 @@ const Subscription = require('../models/Subscription');
 const AIScoringConfig = require('../models/AIScoringConfig');
 const aiScoringConfigValidator = require('../services/aiScoringConfigValidationService');
 const aiScoringService = require('../services/aiScoringService');
+const adminCarrierStatusRoutes = require('./adminCarrierStatus');
 const { auth, authorize } = require('../middleware/auth');
 
 const router = express.Router();
@@ -2719,6 +2720,14 @@ router.post(
       next(error);
     }
   }
+);
+
+/*
+ * Global carrier-status mapping administration.
+ */
+router.use(
+  '/carrier-status',
+  adminCarrierStatusRoutes
 );
 
 module.exports = router;
