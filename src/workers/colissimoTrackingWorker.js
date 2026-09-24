@@ -26,7 +26,6 @@ const terminalStatuses =
   new Set([
     'Livre',
     'Livre paye',
-    'Supprime',
     'Retour definitif',
     'Retour recu paye'
   ]);
@@ -137,6 +136,37 @@ const runSync = async () => {
           `[Colissimo tracking] ${shipment.externalId} -> ${result.status}`
         );
       } catch (error) {
+        try {
+          await DeliveryShipment.updateOne(
+            {
+              _id: shipment._id
+            },
+            {
+              $set: {
+                lastError: {
+                  message:
+                    error.message ||
+                    'Erreur tracking Colissimo',
+
+                  code:
+                    error.statusCode ||
+                    error.response?.status ||
+                    error.code ||
+                    null,
+
+                  at:
+                    new Date()
+                }
+              }
+            }
+          );
+        } catch (persistError) {
+          console.error(
+            `[Colissimo tracking] impossible d'enregistrer l'erreur ${shipment.externalId}:`,
+            persistError.message
+          );
+        }
+
         console.error(
           `[Colissimo tracking] ${shipment.externalId}:`,
           error.message
