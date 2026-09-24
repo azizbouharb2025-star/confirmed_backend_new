@@ -14,6 +14,11 @@ const intigoClient =
   require('./intigoClient');
 
 const {
+  resolveIntigoStatus
+} =
+  require('../carrierStatusMappingService');
+
+const {
   emitOrderUpdate
 } = require('../../websocket/orderEvents');
 
@@ -608,9 +613,20 @@ const getIntigoShipmentStatusPreview =
     }
 
     const mapping =
-      mapIntigoStatus(
-        parcel.status
-      );
+      await resolveIntigoStatus({
+        statusValue:
+          parcel.status,
+
+        /*
+         * Sécurité :
+         * sans configuration active ou si MongoDB
+         * est temporairement inaccessible,
+         * on conserve exactement le mapping Intigo
+         * historique.
+         */
+        fallbackResolver:
+          mapIntigoStatus
+      });
 
     const transition =
       evaluateOrderTransition(
@@ -716,6 +732,14 @@ const getIntigoShipmentStatusPreview =
 
         requiresReview:
           mapping.requiresReview,
+
+        mappingSource:
+          mapping.mappingSource ||
+          'fallback',
+
+        configVersion:
+          mapping.configVersion ??
+          null,
 
         syncEligible:
           transition.eligible,
