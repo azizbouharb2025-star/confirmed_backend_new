@@ -12,6 +12,11 @@ const {
   require('../services/carrierStatusDefaultConfigService');
 
 const {
+  clearCarrierStatusConfigCache
+} =
+  require('../services/carrierStatusMappingService');
+
+const {
   auth,
   authorize
 } = require('../middleware/auth');
@@ -777,6 +782,12 @@ router.post(
           });
         }
 
+        /*
+         * La prochaine résolution transporteur doit
+         * utiliser immédiatement cette nouvelle version.
+         */
+        clearCarrierStatusConfigCache();
+
         return res.json({
           message:
             `Carrier status configuration V${version} activated`,
@@ -907,6 +918,14 @@ router.post(
 
         throw activationError;
       }
+
+      /*
+       * L'ancienne version vient d'être remplacée :
+       * on invalide immédiatement le cache afin que
+       * le prochain événement transporteur lise la
+       * nouvelle configuration active.
+       */
+      clearCarrierStatusConfigCache();
 
       return res.json({
         message:
