@@ -1,3 +1,8 @@
+const {
+  normalizeCustomerPhoneIdentity,
+  buildCustomerPhoneRegex
+} = require('../utils/customerPhoneIdentity');
+
 const Order = require('../models/Order');
 const { resolveTunisiaGovernorate } = require('../utils/tunisiaGovernorateResolver');
 const DeliveryShipment = require('../models/DeliveryShipment');
@@ -400,13 +405,65 @@ class OrderService {
       }
     }
 
-    const phone = order.clientInfo?.phone;
+    /*
+     * L'historique affiché doit utiliser la même identité
+     * client que le moteur de scoring IA.
+     *
+     * On prend en compte :
+     * - téléphone principal ;
+     * - téléphones supplémentaires ;
+     * - téléphone secondaire de livraison.
+     *
+     * La recherche reste limitée à la boutique actuelle.
+     */
+    const additionalPhones =
+      Array.isArray(order.clientInfo?.additionalPhones)
+        ? order.clientInfo.additionalPhones
+        : [];
+
+    const customerPhoneIdentities = [
+      order.clientInfo?.phone,
+      ...additionalPhones,
+      order.deliveryInfo?.secondaryPhone
+    ]
+      .map(normalizeCustomerPhoneIdentity)
+      .filter(Boolean);
+
+    const uniqueCustomerPhoneIdentities = [
+      ...new Set(customerPhoneIdentities)
+    ];
+
+    const customerPhoneRegexes =
+      uniqueCustomerPhoneIdentities
+        .map(buildCustomerPhoneRegex)
+        .filter(Boolean);
 
     let customerHistory = null;
 
-    if (phone) {
+    if (customerPhoneRegexes.length > 0) {
+      const orderShopId =
+        order.shopId?._id ||
+        order.shopId;
+
+      const phoneFields = [
+        'clientInfo.phone',
+        'clientInfo.additionalPhones',
+        'deliveryInfo.secondaryPhone'
+      ];
+
       const customerQuery = {
-        'clientInfo.phone': phone
+        ...(orderShopId
+          ? { shopId: orderShopId }
+          : {}),
+
+        $or: customerPhoneRegexes.flatMap(
+          phoneRegex =>
+            phoneFields.map(
+              field => ({
+                [field]: phoneRegex
+              })
+            )
+        )
       };
 
       const [
