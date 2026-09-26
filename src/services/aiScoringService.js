@@ -3298,22 +3298,33 @@ class AIScoringService {
   generateSummary(order) {
     const factors = order.aiScoreDetails?.factors || [];
 
-    const positiveFactors = factors.filter(
-      factor => factor.applied === true && factor.impact > 0
-    );
+    /*
+     * Le résumé réutilise exclusivement les facteurs déjà
+     * calculés par le moteur de scoring.
+     *
+     * Aucun score ni aucune règle métier n'est recalculé ici.
+     */
+    const positiveFactors = factors
+      .filter(
+        factor =>
+          factor.applied === true &&
+          Number(factor.impact) > 0
+      )
+      .sort(
+        (a, b) =>
+          Number(b.impact) - Number(a.impact)
+      );
 
-    const negativeFactors = factors.filter(
-      factor => factor.applied === true && factor.impact < 0
-    );
-
-    const probabilityText =
-      order.aiScore >= 81
-        ? 'Cette commande présente une très forte probabilité de livraison.'
-        : order.aiScore >= 61
-          ? 'Cette commande présente une bonne probabilité de livraison.'
-          : order.aiScore >= 41
-            ? 'Cette commande présente une probabilité de livraison modérée.'
-            : 'Cette commande présente un risque important nécessitant une vigilance particulière.';
+    const negativeFactors = factors
+      .filter(
+        factor =>
+          factor.applied === true &&
+          Number(factor.impact) < 0
+      )
+      .sort(
+        (a, b) =>
+          Number(a.impact) - Number(b.impact)
+      );
 
     const riskLabels = {
       very_low: 'très faible',
@@ -3329,27 +3340,70 @@ class AIScoringService {
       reject: 'Expédition déconseillée'
     };
 
+    const score =
+      typeof order.aiScore === 'number'
+        ? order.aiScore
+        : null;
+
+    const introduction =
+      score === null
+        ? 'Analyse IA disponible, mais le score global n’est pas déterminé.'
+        : order.aiDecision === 'accept'
+          ? `Le score IA de ${score}/100 indique un profil globalement favorable pour cette commande.`
+          : order.aiDecision === 'review'
+            ? `Le score IA de ${score}/100 indique une situation intermédiaire qui nécessite l’appréciation du vendeur.`
+            : order.aiDecision === 'reject'
+              ? `Le score IA de ${score}/100 met en évidence plusieurs éléments nécessitant une vigilance particulière.`
+              : `Le score IA de ${score}/100 résume les différents facteurs analysés pour cette commande.`;
+
+    const riskLabel =
+      riskLabels[order.riskLevel] ||
+      'non déterminé';
+
+    let factorSummary =
+      'Aucun facteur ayant un impact direct sur le score n’a été identifié.';
+
+    if (
+      positiveFactors.length > 0 &&
+      negativeFactors.length > 0
+    ) {
+      factorSummary =
+        'L’évaluation combine des éléments favorables et des points de vigilance présentés ci-dessus.';
+    } else if (positiveFactors.length > 0) {
+      factorSummary =
+        'Les facteurs ayant un impact sur le score sont globalement favorables.';
+    } else if (negativeFactors.length > 0) {
+      factorSummary =
+        'Les facteurs ayant un impact sur le score appellent principalement à la vigilance.';
+    }
+
     return {
-      introduction: probabilityText,
+      introduction,
 
-      positiveFactors: positiveFactors.map(factor => ({
-        key: factor.key,
-        label: factor.label,
-        value: factor.value,
-        impact: factor.impact
-      })),
+      positiveFactors: positiveFactors.map(
+        factor => ({
+          key: factor.key,
+          label: factor.label,
+          value: factor.value,
+          impact: factor.impact
+        })
+      ),
 
-      warningFactors: negativeFactors.map(factor => ({
-        key: factor.key,
-        label: factor.label,
-        value: factor.value,
-        impact: factor.impact
-      })),
+      warningFactors: negativeFactors.map(
+        factor => ({
+          key: factor.key,
+          label: factor.label,
+          value: factor.value,
+          impact: factor.impact
+        })
+      ),
 
-      conclusion: `Le niveau de risque global est ${riskLabels[order.riskLevel] || 'non déterminé'}.`,
+      conclusion:
+        `Le niveau de risque global est ${riskLabel}. ${factorSummary}`,
 
       recommendation:
-        decisionLabels[order.aiDecision] || 'Décision non déterminée'
+        decisionLabels[order.aiDecision] ||
+        'Décision non déterminée'
     };
   }
 
