@@ -3136,11 +3136,11 @@ class AIScoringService {
    * Convert score to AI decision
    */
   calculateDecision(score) {
-    if (score < 40) {
+    if (score <= 60) {
       return 'reject';
     }
 
-    if (score <= 70) {
+    if (score <= 74) {
       return 'review';
     }
 

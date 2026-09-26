@@ -185,7 +185,7 @@ class OrderService {
       applyMin(61);
       applyMax(74);
     } else if (aiDecision === 'reject') {
-      applyMax(59);
+      applyMax(60);
     }
 
     // Niveau de risque from score.
