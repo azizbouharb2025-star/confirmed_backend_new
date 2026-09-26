@@ -111,11 +111,34 @@ class DeliveryService {
     return response.data.TrackingResults[0];
   }
 
-  async setupDeliveryIntegration(shopId, platform, credentials, settings) {
+  async setupDeliveryIntegration(shopId, platform, credentials = {}, settings = {}) {
+    const existing = await DeliveryIntegration.findOne({
+      shopId,
+      platform
+    });
+
+    const mergedCredentials = {
+      ...(existing?.credentials?.toObject?.() || existing?.credentials || {}),
+      ...credentials
+    };
+
+    const mergedSettings = {
+      ...(existing?.settings?.toObject?.() || existing?.settings || {}),
+      ...settings
+    };
+
     return await DeliveryIntegration.findOneAndUpdate(
       { shopId, platform },
-      { credentials, settings, isActive: true },
-      { upsert: true, new: true }
+      {
+        credentials: mergedCredentials,
+        settings: mergedSettings,
+        isActive: true
+      },
+      {
+        upsert: true,
+        new: true,
+        runValidators: true
+      }
     );
   }
 }

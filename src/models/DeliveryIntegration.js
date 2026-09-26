@@ -34,6 +34,16 @@ const deliveryIntegrationSchema = new mongoose.Schema({
       type: Number,
       min: 0
     },
+    deliveryCost: {
+      type: Number,
+      min: 0,
+      default: 0
+    },
+    returnCost: {
+      type: Number,
+      min: 0,
+      default: 0
+    },
     webhookUrl: String
   },
   isActive: {
