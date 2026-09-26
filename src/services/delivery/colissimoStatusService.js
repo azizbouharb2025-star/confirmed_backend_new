@@ -11,6 +11,11 @@ const DeliveryIntegration =
   require('../../models/DeliveryIntegration');
 
 const {
+  resolveColissimoOrderStatus
+} =
+  require('../carrierStatusMappingService');
+
+const {
   emitOrderUpdate
 } = require('../../websocket/orderEvents');
 
@@ -332,10 +337,24 @@ const syncColissimoShipmentStatus =
         'Inconnu'
       ).trim();
 
+    const mappingResolution =
+      await resolveColissimoOrderStatus({
+        statusValue:
+          providerStatus,
+
+        /*
+         * Sécurité :
+         * tant qu'aucune configuration Admin
+         * n'est active, ou si MongoDB rencontre
+         * temporairement une erreur, on conserve
+         * exactement le mapping Colissimo actuel.
+         */
+        fallbackResolver:
+          mapColissimoOrderStatus
+      });
+
     const proposedOrderStatus =
-      mapColissimoOrderStatus(
-        providerStatus
-      );
+      mappingResolution.orderStatus;
 
     const previousProviderStatusLabel =
       shipment.providerStatusLabel ||
