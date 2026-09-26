@@ -173,18 +173,21 @@ const buildInitialCarrierStatusMappings = () => ({
       order: 2
     },
 
-    /*
-     * "Retour depot" volontairement absent.
-     * Sa signification métier doit être confirmée
-     * avant d'être ajoutée à une configuration active.
-     */
+    {
+      providerStatus: 'Retour depot',
+      label: 'Retour dépôt',
+      mappedOrderStatus: 'at_depot',
+      enabled: true,
+      order: 3
+    },
+
 
     {
       providerStatus: 'En cours',
       label: 'En cours de livraison',
       mappedOrderStatus: 'out_for_delivery',
       enabled: true,
-      order: 3
+      order: 4
     },
 
     {
@@ -192,7 +195,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Retour expéditeur',
       mappedOrderStatus: 'returned',
       enabled: true,
-      order: 4
+      order: 5
     },
 
     {
@@ -200,7 +203,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Retour inter agence',
       mappedOrderStatus: 'returned',
       enabled: true,
-      order: 5
+      order: 6
     },
 
     {
@@ -208,7 +211,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Retour payé',
       mappedOrderStatus: 'returned',
       enabled: true,
-      order: 6
+      order: 7
     },
 
     {
@@ -216,7 +219,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Retour définitif',
       mappedOrderStatus: 'returned',
       enabled: true,
-      order: 7
+      order: 8
     },
 
     {
@@ -224,7 +227,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Retour reçu payé',
       mappedOrderStatus: 'returned',
       enabled: true,
-      order: 8
+      order: 9
     },
 
     {
@@ -232,7 +235,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'En attente',
       mappedOrderStatus: null,
       enabled: true,
-      order: 9
+      order: 10
     },
 
     {
@@ -240,7 +243,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Échange',
       mappedOrderStatus: null,
       enabled: true,
-      order: 10
+      order: 11
     },
 
     {
@@ -248,7 +251,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Supprimé',
       mappedOrderStatus: null,
       enabled: true,
-      order: 11
+      order: 12
     },
 
     {
@@ -256,7 +259,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Non reçu',
       mappedOrderStatus: null,
       enabled: true,
-      order: 12
+      order: 13
     },
 
     {
@@ -264,7 +267,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'À enlever',
       mappedOrderStatus: null,
       enabled: true,
-      order: 13
+      order: 14
     },
 
     {
@@ -272,7 +275,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Enlevé',
       mappedOrderStatus: null,
       enabled: true,
-      order: 14
+      order: 15
     },
 
     {
@@ -280,7 +283,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'À vérifier',
       mappedOrderStatus: null,
       enabled: true,
-      order: 15
+      order: 16
     },
 
     {
@@ -288,7 +291,7 @@ const buildInitialCarrierStatusMappings = () => ({
       label: 'Inconnu',
       mappedOrderStatus: null,
       enabled: true,
-      order: 16
+      order: 17
     }
   ]
 });

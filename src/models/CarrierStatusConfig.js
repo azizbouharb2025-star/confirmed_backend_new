@@ -49,6 +49,7 @@ const intigoMappingSchema = new mongoose.Schema(
     mappedOrderStatus: {
       type: String,
       enum: [
+        null,
         'shipped',
         'at_depot',
         'out_for_delivery',
@@ -108,6 +109,7 @@ const colissimoMappingSchema = new mongoose.Schema(
     mappedOrderStatus: {
       type: String,
       enum: [
+        null,
         'shipped',
         'at_depot',
         'out_for_delivery',
