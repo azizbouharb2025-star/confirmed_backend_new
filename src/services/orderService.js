@@ -644,7 +644,13 @@ class OrderService {
 
     const customerValueQuery = {
       ...baseValueQuery,
-      'clientInfo.phone': phone
+      $or: customerPhoneRegexes.flatMap(
+        phoneRegex => [
+          { 'clientInfo.phone': phoneRegex },
+          { 'clientInfo.additionalPhones': phoneRegex },
+          { 'deliveryInfo.secondaryPhone': phoneRegex }
+        ]
+      )
     };
 
     const [shopValueStats, customerValueStats] = await Promise.all([
@@ -659,7 +665,7 @@ class OrderService {
         }
       ]),
 
-      phone
+      customerPhoneRegexes.length > 0
         ? Order.aggregate([
             { $match: customerValueQuery },
             {
