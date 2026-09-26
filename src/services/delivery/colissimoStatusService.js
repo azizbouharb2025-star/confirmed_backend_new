@@ -10,6 +10,10 @@ const DeliveryShipment =
 const DeliveryIntegration =
   require('../../models/DeliveryIntegration');
 
+const {
+  emitOrderUpdate
+} = require('../../websocket/orderEvents');
+
 const TRACKING_URL =
   'https://colissimodelivery.tn/api/v1/etat.php';
 
@@ -17,48 +21,193 @@ const TRACKING_URL =
  * Mapping STRICTEMENT Colissimo.
  * Aucun statut inconnu ne modifie automatiquement la commande.
  */
+const normalizeColissimoStatus = value =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+
+/*
+ * Traduit uniquement les statuts Colissimo
+ * dont la signification métier est suffisamment claire.
+ *
+ * Les états ambigus/techniques restent conservés dans
+ * DeliveryShipment mais ne modifient pas automatiquement
+ * Order.status.
+ */
 const mapColissimoOrderStatus = value => {
   const status =
-    String(value || '').trim();
+    normalizeColissimoStatus(value);
 
   if (
     [
-      'Livre',
-      'Livre paye'
+      'livre',
+      'livre paye'
     ].includes(status)
   ) {
     return 'delivered';
   }
 
+  /*
+   * Dépôt initial OU retour au dépôt après
+   * une tentative de livraison.
+   *
+   * Important :
+   * Retour dépôt !== retour définitif expéditeur.
+   */
   if (
     [
-      'En cours',
-      'Au depot'
+      'au depot',
+      'retour depot'
     ].includes(status)
   ) {
-    return 'shipped';
+    return 'at_depot';
   }
 
+  if (status === 'en cours') {
+    return 'out_for_delivery';
+  }
+
+  /*
+   * Véritable processus de retour vers l'expéditeur.
+   */
   if (
     [
-      'Non recu',
-      'Retour Expediteur',
-      'Retour Inter Agence',
-      'Retour depot',
-      'Retour paye',
-      'Retour definitif',
-      'Retour recu paye'
+      'retour expediteur',
+      'retour inter agence',
+      'retour paye',
+      'retour definitif',
+      'retour recu paye'
     ].includes(status)
   ) {
-    return 'failed_delivery';
+    return 'returned';
   }
 
-  if (status === 'Supprime') {
-    return 'cancelled';
-  }
-
+  /*
+   * En attente / Echange / Supprime / Non recu /
+   * A enlever / Enleve / A verifier / Inconnu
+   * et tout futur statut inconnu :
+   * aucune mutation automatique du statut métier.
+   */
   return null;
 };
+
+
+/*
+ * Le cycle logistique n'est pas strictement linéaire.
+ *
+ * Une tentative peut revenir au dépôt puis repartir
+ * en livraison. Une ancienne commande marquée
+ * failed_delivery par l'ancien mapping doit également
+ * pouvoir être réalignée avec le nouveau workflow.
+ */
+const evaluateColissimoOrderTransition = (
+  currentStatus,
+  proposedStatus
+) => {
+  if (!proposedStatus) {
+    return {
+      eligible: false,
+      reason:
+        'provider_status_does_not_change_order'
+    };
+  }
+
+  if (currentStatus === proposedStatus) {
+    return {
+      eligible: false,
+      reason:
+        'already_aligned'
+    };
+  }
+
+  /*
+   * Une livraison réellement terminée ainsi que les
+   * annulations/rejets restent terminales.
+   */
+  if (
+    [
+      'delivered',
+      'cancelled',
+      'rejected'
+    ].includes(currentStatus)
+  ) {
+    return {
+      eligible: false,
+      reason:
+        'local_status_is_terminal'
+    };
+  }
+
+  const allowed = {
+    confirmed: [
+      'at_depot',
+      'out_for_delivery',
+      'delivered',
+      'returned'
+    ],
+
+    shipped: [
+      'at_depot',
+      'out_for_delivery',
+      'delivered',
+      'returned'
+    ],
+
+    at_depot: [
+      'out_for_delivery',
+      'delivered',
+      'returned'
+    ],
+
+    out_for_delivery: [
+      'at_depot',
+      'delivered',
+      'returned'
+    ],
+
+    /*
+     * Le transporteur peut réellement remettre
+     * un colis en circulation après un événement
+     * précédemment interprété comme retour.
+     */
+    returned: [
+      'at_depot',
+      'out_for_delivery',
+      'delivered'
+    ],
+
+    /*
+     * Compatibilité avec les commandes créées
+     * avant le nouveau mapping.
+     */
+    failed_delivery: [
+      'at_depot',
+      'out_for_delivery',
+      'delivered',
+      'returned'
+    ]
+  };
+
+  if (
+    !allowed[currentStatus]
+      ?.includes(proposedStatus)
+  ) {
+    return {
+      eligible: false,
+      reason:
+        'transition_not_allowed'
+    };
+  }
+
+  return {
+    eligible: true,
+    reason:
+      'transition_allowed'
+  };
+};
+
 
 const syncColissimoShipmentStatus =
   async ({
@@ -183,6 +332,18 @@ const syncColissimoShipmentStatus =
         'Inconnu'
       ).trim();
 
+    const proposedOrderStatus =
+      mapColissimoOrderStatus(
+        providerStatus
+      );
+
+    const previousProviderStatusLabel =
+      shipment.providerStatusLabel ||
+      null;
+
+    const previousProviderStatusCode =
+      shipment.providerStatusCode;
+
     shipment.providerStatusCode =
       data.status;
 
@@ -210,48 +371,142 @@ const syncColissimoShipmentStatus =
       }
     };
 
+    /*
+     * Historique transporteur :
+     * on ajoute une entrée uniquement lorsque
+     * l'état Colissimo change réellement.
+     *
+     * Les synchronisations répétées du même état
+     * ne polluent donc pas l'historique.
+     */
+    const providerStatusChanged =
+      previousProviderStatusLabel !==
+        providerStatus ||
+      String(previousProviderStatusCode ?? '') !==
+        String(data.status ?? '');
+
+    if (providerStatusChanged) {
+      shipment.providerStatusHistory.push({
+        code:
+          data.status,
+
+        label:
+          providerStatus,
+
+        mappedOrderStatus:
+          proposedOrderStatus ||
+          undefined,
+
+        occurredAt:
+          new Date(),
+
+        rawEvent: {
+          status:
+            data.status,
+
+          statusMessage:
+            data.status_message || '',
+
+          etat:
+            providerStatus,
+
+          motif:
+            data.motif || '',
+
+          preEtat:
+            data.pre_etat || '',
+
+          preMotif:
+            data.pre_motif || ''
+        }
+      });
+    }
+
     shipment.lastError =
       undefined;
 
     await shipment.save();
 
-    const proposedOrderStatus =
-      mapColissimoOrderStatus(
-        providerStatus
+    const transition =
+      evaluateColissimoOrderTransition(
+        order.status,
+        proposedOrderStatus
       );
 
     /*
-     * Ne jamais rétrograder une commande déjà livrée.
-     * Les statuts inconnus / ambigus restent sans effet.
+     * Historique métier CONFIRMED.
+     *
+     * On ne mélange pas le statut technique Colissimo
+     * avec le statut simplifié affiché au vendeur.
      */
-    if (
-      proposedOrderStatus &&
-      !(
-        order.status === 'delivered' &&
-        proposedOrderStatus !== 'delivered'
-      ) &&
-      order.status !== proposedOrderStatus
-    ) {
-      order.status =
-        proposedOrderStatus;
+    if (transition.eligible) {
+      const previousOrderStatus =
+        order.status;
 
-      if (
-        proposedOrderStatus === 'shipped' &&
-        !order.shippedAt
-      ) {
-        order.shippedAt =
-          new Date();
+      const changedAt =
+        new Date();
+
+      /*
+       * Mise à jour atomique :
+       * le statut doit toujours être celui que nous avons
+       * lu avant l'appel Colissimo.
+       *
+       * Ainsi, un autre worker ne peut pas être écrasé.
+       */
+      const updatedOrder =
+        await Order.findOneAndUpdate(
+          {
+            _id:
+              order._id,
+
+            shopId,
+
+            status:
+              previousOrderStatus
+          },
+
+          {
+            $set: {
+              status:
+                proposedOrderStatus
+            },
+
+            $push: {
+              statusHistory: {
+                status:
+                  proposedOrderStatus,
+
+                timestamp:
+                  changedAt,
+
+                source:
+                  'courier',
+
+                reason:
+                  `Synchronisation Colissimo : ${providerStatus}`,
+
+                notes:
+                  data.motif ||
+                  `Statut précédent : ${previousOrderStatus}`
+              }
+            }
+          },
+
+          {
+            new:
+              true
+          }
+        );
+
+      /*
+       * Mise à jour temps réel uniquement lorsque
+       * MongoDB a réellement appliqué la transition.
+       */
+      if (updatedOrder) {
+        emitOrderUpdate(
+          updatedOrder
+        );
       }
-
-      if (
-        proposedOrderStatus === 'delivered' &&
-        !order.deliveredAt
-      ) {
-        order.deliveredAt =
-          new Date();
-      }
-
-      await order.save();
     }
 
     return {
