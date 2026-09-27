@@ -211,6 +211,15 @@ class ExportService {
       const idSet = new Set(orderIds.map(String));
       orders = orders.filter(o => idSet.has(String(o._id)));
     }
+
+    /*
+     * Logistics export eligibility:
+     * only confirmed or postponed orders may be exported.
+     */
+    orders = orders.filter(order =>
+      ['confirmed', 'postponed'].includes(order.status)
+    );
+
     return orders;
   }
 
