@@ -1,8 +1,59 @@
 const logger = require('../utils/logger');
 const Order = require('../models/Order');
+const {
+  createOrderNotification
+} = require('../services/inAppNotificationService');
 
 // Store io instance for use in emit functions
 let ioInstance = null;
+
+const persistAndEmitNotification = ({
+  eventType,
+  order,
+  shopId
+}) => {
+  createOrderNotification({
+    eventType,
+    order,
+    shopId
+  })
+    .then(notification => {
+      if (!notification || !ioInstance) {
+        return;
+      }
+
+      const payload = notification.toObject();
+
+      delete payload.readBy;
+
+      const message = {
+        ...payload,
+        isRead: false
+      };
+
+      const shopRoom = `shop:${shopId}`;
+
+      ioInstance
+        .to(shopRoom)
+        .emit(
+          'notification:new',
+          message
+        );
+
+      ioInstance
+        .to('admin')
+        .emit(
+          'notification:new',
+          message
+        );
+    })
+    .catch(error => {
+      logger.error(
+        'Failed to emit persistent notification:',
+        error
+      );
+    });
+};
 
 // Store order events for sync requests
 const orderEventStore = [];
@@ -196,6 +247,14 @@ const emitOrderUpdate = (order) => {
 
   // Also emit to admin room
   ioInstance.to('admin').emit('order:update', message);
+
+  if (shopId) {
+    persistAndEmitNotification({
+      eventType: 'order:update',
+      order: enhancedOrder,
+      shopId
+    });
+  }
 };
 
 /**
@@ -231,6 +290,14 @@ const emitOrderNew = (order) => {
 
   // Also emit to admin room
   ioInstance.to('admin').emit('order:new', message);
+
+  if (shopId) {
+    persistAndEmitNotification({
+      eventType: 'order:new',
+      order,
+      shopId
+    });
+  }
 };
 
 /**

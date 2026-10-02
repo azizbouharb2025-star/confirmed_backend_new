@@ -4,11 +4,15 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/database');
-const { connectRedis } = require('./config/redis');
+const {
+  connectRedis,
+  getRedisClient
+} = require('./config/redis');
 const logger = require('./utils/logger');
 const errorHandler = require('./middleware/errorHandler');
 const backgroundJobs = require('./jobs/backgroundJobs');
@@ -37,10 +41,14 @@ const complaintRoutes = require('./routes/complaints');
 const supportCardRoutes = require('./routes/supportCards');
 const userRoutes = require('./routes/users');
 const teamRoutes = require('./routes/team');
+const notificationRoutes = require('./routes/notifications');
 
 const app = express();
 app.set('trust proxy', 1); // Trust first proxy (nginx)
 const server = http.createServer(app);
+
+let socketRedisPubClient = null;
+let socketRedisSubClient = null;
 
 // Serve uploaded files (before other middleware to avoid blocking)
 const uploadsPath = path.join(__dirname, '..', 'uploads');
@@ -225,6 +233,7 @@ app.use('/api/complaints', complaintRoutes);
 app.use('/api/support-cards', supportCardRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/team', teamRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 
 
@@ -238,6 +247,57 @@ async function startServer() {
   try {
     await connectDB();
     await connectRedis();
+
+    const redisClient = getRedisClient();
+
+    if (redisClient) {
+      try {
+        socketRedisPubClient =
+          redisClient.duplicate();
+
+        socketRedisSubClient =
+          redisClient.duplicate();
+
+        await Promise.all([
+          socketRedisPubClient.connect(),
+          socketRedisSubClient.connect()
+        ]);
+
+        io.adapter(
+          createAdapter(
+            socketRedisPubClient,
+            socketRedisSubClient
+          )
+        );
+
+        logger.info(
+          'Socket.IO Redis adapter connected'
+        );
+      } catch (error) {
+        logger.warn(
+          'Socket.IO Redis adapter unavailable, using local adapter:',
+          error.message
+        );
+
+        if (
+          socketRedisPubClient?.isOpen
+        ) {
+          await socketRedisPubClient.quit()
+            .catch(() => {});
+        }
+
+        if (
+          socketRedisSubClient?.isOpen
+        ) {
+          await socketRedisSubClient.quit()
+            .catch(() => {});
+        }
+
+        socketRedisPubClient = null;
+        socketRedisSubClient = null;
+      }
+    }
+
     backgroundJobs.start();
     
     server.listen(PORT, '0.0.0.0', () => {
@@ -269,9 +329,25 @@ const gracefulShutdown = async (signal) => {
         logger.info('WebSocket server closed');
       });
       
-      // Close Redis connection
-      const redis = require('./config/redis').getRedisClient();
-      if (redis) {
+      // Close Socket.IO Redis adapter clients
+      if (socketRedisPubClient?.isOpen) {
+        await socketRedisPubClient.quit();
+        logger.info(
+          'Socket.IO Redis pub client closed'
+        );
+      }
+
+      if (socketRedisSubClient?.isOpen) {
+        await socketRedisSubClient.quit();
+        logger.info(
+          'Socket.IO Redis sub client closed'
+        );
+      }
+
+      // Close main Redis connection
+      const redis = getRedisClient();
+
+      if (redis?.isOpen) {
         await redis.quit();
         logger.info('Redis connection closed');
       }
