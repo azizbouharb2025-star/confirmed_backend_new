@@ -42,6 +42,7 @@ const supportCardRoutes = require('./routes/supportCards');
 const userRoutes = require('./routes/users');
 const teamRoutes = require('./routes/team');
 const notificationRoutes = require('./routes/notifications');
+const walletRoutes = require('./routes/wallet');
 
 const app = express();
 app.set('trust proxy', 1); // Trust first proxy (nginx)
@@ -234,6 +235,7 @@ app.use('/api/support-cards', supportCardRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/team', teamRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/wallet', walletRoutes);
 
 
 

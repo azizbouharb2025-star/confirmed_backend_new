@@ -185,23 +185,77 @@ class AnalyticsService {
         '90d': 90
       };
 
+      const allowedPeriods = ['today', ...Object.keys(periodDays)];
+
       const selectedPeriod =
         typeof period === 'string' &&
-        Object.prototype.hasOwnProperty.call(periodDays, period)
+        allowedPeriods.includes(period)
           ? period
           : '7d';
 
-      const durationDays = periodDays[selectedPeriod];
+      let periodEnd;
+      let periodStart;
+      let previousPeriodEnd;
+      let previousPeriodStart;
 
-      const periodEnd = new Date();
-      const periodStart = new Date(
-        periodEnd.getTime() - durationDays * 24 * 60 * 60 * 1000
-      );
+      if (selectedPeriod === 'today') {
+        /*
+         * "Aujourd'hui" suit la journée calendaire tunisienne.
+         * Le serveur tourne en UTC, alors que la Tunisie est UTC+1.
+         */
+        const now = new Date();
 
-      const previousPeriodEnd = new Date(periodStart);
-      const previousPeriodStart = new Date(
-        previousPeriodEnd.getTime() - durationDays * 24 * 60 * 60 * 1000
-      );
+        const tunisParts = new Intl.DateTimeFormat('en-US', {
+          timeZone: 'Africa/Tunis',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).formatToParts(now);
+
+        const tunisDate = tunisParts.reduce((acc, part) => {
+          if (
+            part.type === 'year' ||
+            part.type === 'month' ||
+            part.type === 'day'
+          ) {
+            acc[part.type] = part.value;
+          }
+
+          return acc;
+        }, {});
+
+        periodEnd = now;
+
+        periodStart = new Date(
+          `${tunisDate.year}-${tunisDate.month}-${tunisDate.day}T00:00:00+01:00`
+        );
+
+        const elapsedToday =
+          periodEnd.getTime() - periodStart.getTime();
+
+        previousPeriodStart = new Date(
+          periodStart.getTime() - 24 * 60 * 60 * 1000
+        );
+
+        previousPeriodEnd = new Date(
+          previousPeriodStart.getTime() + elapsedToday
+        );
+      } else {
+        const durationDays = periodDays[selectedPeriod];
+
+        periodEnd = new Date();
+
+        periodStart = new Date(
+          periodEnd.getTime() - durationDays * 24 * 60 * 60 * 1000
+        );
+
+        previousPeriodEnd = new Date(periodStart);
+
+        previousPeriodStart = new Date(
+          previousPeriodEnd.getTime() -
+            durationDays * 24 * 60 * 60 * 1000
+        );
+      }
 
       // Une commande ayant atteint l'un de ces statuts a déjà franchi
       // l'étape de confirmation dans son cycle de vie.
